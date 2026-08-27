@@ -1,0 +1,15 @@
+id = "youguanxinqing.herdr-flash"
+name = "Herdr Flash"
+version = "0.1.0"
+min_herdr_version = "0.7.4"
+description = "flash.nvim-style incremental search, vim-motion selection, and yank over visible Herdr pane text"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["./scripts/build.sh"]
+
+[[actions]]
+id = "flash"
+title = "Flash: search visible text, select, and yank"
+contexts = ["pane", "workspace"]
+command = ["./bin/herdr-flash", "flash"]
