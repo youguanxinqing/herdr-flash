@@ -3,6 +3,7 @@ use crate::herdr::layout::{derive_layout_recreation_plan, derive_source_geometry
 use crate::herdr::snapshot::{build_source_snapshot, PickerLaunchFiles};
 use crate::model::{
     LayoutNode, PaneId, PatternSpec, PickerAction, PickerReturnContext, PickerSnapshot,
+    StylePalette,
 };
 use crate::viewport::map_visible_viewport;
 use anyhow::{bail, Context, Result};
@@ -16,6 +17,7 @@ pub fn launch_layout_tab_picker<C: HerdrClient>(
     action: PickerAction,
     custom_patterns: Vec<PatternSpec>,
     flash_exit_on_yank: bool,
+    palette: StylePalette,
 ) -> Result<()> {
     let layout = client.pane_layout(target)?;
     let plan = derive_layout_recreation_plan(&layout, target)?;
@@ -52,6 +54,7 @@ pub fn launch_layout_tab_picker<C: HerdrClient>(
         action,
         custom_patterns,
         flash_exit_on_yank,
+        palette,
     )?;
 
     let files = PickerLaunchFiles::create(&snapshot)?;
@@ -209,7 +212,8 @@ mod tests {
     use crate::herdr::client::AppliedLayout;
     use crate::herdr::layout::{LayoutPane, LayoutSnapshot};
     use crate::model::{
-        PaneTextCaptureMode, Rect, SourcePaneSnapshot, SplitDirection, VisibleViewport,
+        PaneTextCaptureMode, Rect, SourcePaneSnapshot, SplitDirection, StylePalette,
+        VisibleViewport,
     };
     use anyhow::anyhow;
 
@@ -333,6 +337,7 @@ mod tests {
             action: PickerAction::Copy,
             custom_patterns: Vec::new(),
             flash_exit_on_yank: true,
+            palette: StylePalette::default(),
         }
     }
 
@@ -396,6 +401,7 @@ mod tests {
             PickerAction::Copy,
             Vec::new(),
             true,
+            StylePalette::default(),
         )
         .unwrap();
 
@@ -434,6 +440,7 @@ mod tests {
             PickerAction::Copy,
             Vec::new(),
             true,
+            StylePalette::default(),
         )
         .unwrap_err();
 

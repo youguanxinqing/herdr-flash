@@ -6,7 +6,7 @@ mod protocol;
 pub mod snapshot;
 mod socket;
 
-use crate::config::{resolve_flash_exit_on_yank, resolve_pattern_specs};
+use crate::config::{resolve_flash_exit_on_yank, resolve_palette, resolve_pattern_specs};
 use crate::herdr::client::SocketHerdrClient;
 use crate::herdr::context::HerdrContext;
 use crate::herdr::executor::{
@@ -71,6 +71,7 @@ impl HerdrAdapter {
             PickerAction::Flash => resolve_flash_exit_on_yank(),
             PickerAction::Copy | PickerAction::OpenUrl => true,
         };
+        let palette = resolve_palette();
         let mut client = SocketHerdrClient::from_context(&self.context)?;
         launch_layout_tab_picker(
             &mut client,
@@ -79,6 +80,7 @@ impl HerdrAdapter {
             action,
             patterns,
             flash_exit_on_yank,
+            palette,
         )?;
         Ok(())
     }

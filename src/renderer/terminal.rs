@@ -1,4 +1,4 @@
-use crate::model::{RenderLine, RenderStyle};
+use crate::model::{RenderLine, RenderStyle, StylePalette};
 use anyhow::Result;
 use crossterm::{
     cursor::MoveTo,
@@ -19,14 +19,18 @@ use std::io::Write;
 /// place is complete; a one-shot emit that covers less must `clear_screen` first. The frame is
 /// also assembled in memory and handed over as one write, keeping a mid-write composite down to
 /// a soft tear.
-pub fn emit_render_lines(writer: &mut impl Write, lines: &[RenderLine]) -> Result<()> {
+pub fn emit_render_lines(
+    writer: &mut impl Write,
+    lines: &[RenderLine],
+    palette: &StylePalette,
+) -> Result<()> {
     let mut frame = Vec::new();
     queue!(frame, BeginSynchronizedUpdate)?;
 
     for (line_index, line) in lines.iter().enumerate() {
         queue!(frame, MoveTo(0, line_index as u16))?;
         for span in &line.spans {
-            queue_style(&mut frame, span.style)?;
+            queue_style(&mut frame, span.style, palette)?;
             queue!(frame, Print(&span.text))?;
         }
     }
@@ -49,46 +53,25 @@ pub fn clear_screen(writer: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-fn queue_style(writer: &mut impl Write, style: RenderStyle) -> Result<()> {
-    match style {
-        // Every arm must open with a reset. Without one this style inherits whatever background
-        // the previous span set, and a lone Hint cell bleeds cyan across the rest of the frame.
-        RenderStyle::Unmatched => queue!(
-            writer,
-            SetAttribute(Attribute::Reset),
-            SetForegroundColor(Color::DarkGrey),
-            SetAttribute(Attribute::Dim)
-        )?,
-        RenderStyle::Match => queue!(
-            writer,
-            SetAttribute(Attribute::Reset),
-            SetForegroundColor(Color::Yellow)
-        )?,
-        RenderStyle::Hint => queue!(
-            writer,
-            SetAttribute(Attribute::Reset),
-            SetForegroundColor(Color::Black),
-            SetBackgroundColor(Color::Cyan),
-            SetAttribute(Attribute::Bold)
-        )?,
-        // Vim's visual mode only paints a background; the text underneath keeps its own colour.
-        // Reset alone restores the terminal's default foreground, which reads brighter than the
-        // dimmed grey around it without shouting like the yellow match colour.
-        RenderStyle::Selection => queue!(
-            writer,
-            SetAttribute(Attribute::Reset),
-            SetBackgroundColor(Color::Rgb {
-                r: 0x4d,
-                g: 0x3a,
-                b: 0x4a
-            })
-        )?,
-        RenderStyle::Cursor => queue!(
-            writer,
-            SetAttribute(Attribute::Reset),
-            SetForegroundColor(Color::Black),
-            SetBackgroundColor(Color::White)
-        )?,
+fn queue_style(writer: &mut impl Write, style: RenderStyle, palette: &StylePalette) -> Result<()> {
+    let spec = match style {
+        RenderStyle::Unmatched => palette.unmatched,
+        RenderStyle::Match => palette.matched,
+        RenderStyle::Hint => palette.label,
+        RenderStyle::Selection => palette.selection,
+        RenderStyle::Cursor => palette.cursor,
+    };
+    // Every span opens with a reset. Without one a style inherits whatever background the
+    // previous span set, and a lone label cell bleeds its background across the rest of the frame.
+    queue!(writer, SetAttribute(Attribute::Reset))?;
+    if let Some([r, g, b]) = spec.fg {
+        queue!(writer, SetForegroundColor(Color::Rgb { r, g, b }))?;
+    }
+    if let Some([r, g, b]) = spec.bg {
+        queue!(writer, SetBackgroundColor(Color::Rgb { r, g, b }))?;
+    }
+    if spec.bold {
+        queue!(writer, SetAttribute(Attribute::Bold))?;
     }
     Ok(())
 }
@@ -96,7 +79,7 @@ fn queue_style(writer: &mut impl Write, style: RenderStyle) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{RenderSpan, RenderStyle};
+    use crate::model::{RenderSpan, RenderStyle, StylePalette};
 
     /// Pins crossterm's global color switch on so exact escape assertions hold even when the
     /// ambient environment sets NO_COLOR, which would otherwise suppress the color sequences.
@@ -125,7 +108,7 @@ mod tests {
         }];
         let mut output = Vec::new();
 
-        emit_render_lines(&mut output, &lines).unwrap();
+        emit_render_lines(&mut output, &lines, &StylePalette::default()).unwrap();
         let output = String::from_utf8(output).unwrap();
 
         assert!(output.starts_with("\u{1b}[?2026h\u{1b}[1;1H"));
@@ -135,9 +118,9 @@ mod tests {
         assert!(output.contains("open "));
         assert!(output.contains("a"));
         assert!(output.contains("ttps://example.com"));
-        assert!(output.contains("\u{1b}[38;5;0m"));
-        assert!(output.contains("\u{1b}[48;5;14m"));
-        assert!(output.contains("\u{1b}[38;5;11m"));
+        assert!(output.contains("\u{1b}[38;2;122;130;148m"));
+        assert!(output.contains("\u{1b}[48;2;255;0;124m"));
+        assert!(output.contains("\u{1b}[48;2;62;104;215m"));
     }
 
     #[test]
@@ -157,11 +140,11 @@ mod tests {
         }];
         let mut output = Vec::new();
 
-        emit_render_lines(&mut output, &lines).unwrap();
+        emit_render_lines(&mut output, &lines, &StylePalette::default()).unwrap();
         let output = String::from_utf8(output).unwrap();
 
         let hint_bg = output
-            .find("\u{1b}[48;5;14m")
+            .find("\u{1b}[48;2;255;0;124m")
             .expect("hint sets a background");
         let reset_after = output[hint_bg..]
             .find("\u{1b}[0m")
@@ -192,7 +175,7 @@ mod tests {
         ];
         let mut output = Vec::new();
 
-        emit_render_lines(&mut output, &lines).unwrap();
+        emit_render_lines(&mut output, &lines, &StylePalette::default()).unwrap();
         let output = String::from_utf8(output).unwrap();
 
         assert!(output.contains("\u{1b}[1;1H"));
@@ -206,5 +189,30 @@ mod tests {
         let mut output = Vec::new();
         clear_screen(&mut output).unwrap();
         assert_eq!(String::from_utf8(output).unwrap(), "\u{1b}[2J");
+    }
+
+    #[test]
+    fn a_custom_palette_drives_the_emitted_colors() {
+        force_colors();
+        let mut palette = StylePalette::default();
+        palette.label = crate::model::StyleSpec {
+            fg: None,
+            bg: Some([1, 2, 3]),
+            bold: false,
+        };
+        let lines = vec![RenderLine {
+            spans: vec![RenderSpan {
+                text: "a".to_string(),
+                style: RenderStyle::Hint,
+            }],
+        }];
+        let mut output = Vec::new();
+
+        emit_render_lines(&mut output, &lines, &palette).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("\u{1b}[48;2;1;2;3m"));
+        assert!(!output.contains("\u{1b}[48;2;255;0;124m"));
+        assert!(!output.contains("\u{1b}[1m"), "bold was overridden off");
     }
 }

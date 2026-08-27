@@ -47,6 +47,29 @@ exit_on_yank = false
 
 Each copy is acknowledged on the status row and the search resets for the next grab.
 
+### Colors
+
+The default palette is the flash.nvim look. Five styles cover everything the picker draws:
+
+| Style | What it paints | Default |
+|-------|----------------|---------|
+| `unmatched` | the pane text around your matches, dimmed so hits stand out | grey `#7a8294` |
+| `match` | every hit of the current query, and the query on the status row | white on blue `#3e68d7` |
+| `label` | the jump key drawn just past each hit, and the `flash` chip | white on magenta `#ff007c`, bold |
+| `selection` | the body of an active `v`/`V` selection | dusk `#4d3a4a` background |
+| `cursor` | the movable end of the cursor/selection | black on white |
+
+Override any of them under `[colors]` in the same config file. Each style takes `fg` and `bg` as `"#rrggbb"` hex or `"none"` to clear that channel back to the terminal default, plus a `bold` boolean:
+
+```toml
+[colors]
+unmatched = { fg = "#6f7788" }               # dim the backdrop further
+label = { bg = "#e91e63" }                   # a softer pink; fg and bold keep their defaults
+match = { bg = "none", fg = "#e5c07b" }      # no fill — plain yellow text instead
+```
+
+Omitted styles and omitted keys keep their defaults; an invalid value is ignored with a warning on stderr rather than breaking the picker. Colors are 24-bit, which Herdr and every modern terminal support.
+
 ## Requirements
 
 - Herdr 0.7.4 or newer

@@ -75,7 +75,7 @@ where
             None => prompt_line(&labels, &query, notice.as_deref(), cols),
         };
         let lines = compose_frame(content, status, cols, rows);
-        terminal::emit_render_lines(output, &lines)?;
+        terminal::emit_render_lines(output, &lines, &snapshot.palette)?;
         output.flush()?;
 
         let event = input.read_event()?;
@@ -354,6 +354,7 @@ mod tests {
     use crate::clipboard::{ClipboardError, CopySuccess};
     use crate::model::{
         PaneId, PaneTextCaptureMode, PickerAction, PickerReturnContext, SourcePaneSnapshot,
+        StylePalette,
     };
     use anyhow::anyhow;
     use std::cell::RefCell;
@@ -413,6 +414,7 @@ mod tests {
             action: PickerAction::Flash,
             custom_patterns: Vec::new(),
             flash_exit_on_yank: true,
+            palette: StylePalette::default(),
         }
     }
 

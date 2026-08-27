@@ -1,4 +1,4 @@
-use crate::model::PatternSpec;
+use crate::model::{PatternSpec, StylePalette, StyleSpec};
 use crate::patterns::CustomPatternDefinition;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -15,7 +15,29 @@ struct GlobalConfigFile {
     #[serde(default)]
     flash: FlashConfig,
     #[serde(default)]
+    colors: ColorsConfig,
+    #[serde(default)]
     patterns: Vec<PatternConfigEntry>,
+}
+
+/// `[colors]` overrides, one optional entry per picker style.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+struct ColorsConfig {
+    unmatched: Option<StyleOverride>,
+    #[serde(rename = "match")]
+    matched: Option<StyleOverride>,
+    label: Option<StyleOverride>,
+    selection: Option<StyleOverride>,
+    cursor: Option<StyleOverride>,
+}
+
+/// One style override: `fg`/`bg` take `"#rrggbb"` or `"none"` (clear the channel), `bold` a bool.
+/// Omitted keys keep the default; invalid values warn and keep the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+struct StyleOverride {
+    fg: Option<String>,
+    bg: Option<String>,
+    bold: Option<bool>,
 }
 
 /// Flash-mode behaviour from global config.
@@ -82,6 +104,57 @@ fn default_project_pattern_files() -> Vec<String> {
 /// carried to the picker inside the snapshot, the same way custom patterns travel.
 pub fn resolve_flash_exit_on_yank() -> bool {
     load_global_config().map_or(true, |config| config.flash.exit_on_yank)
+}
+
+/// Picker colors: defaults overridden per style by `[colors]`. Read in the action process and
+/// carried in the snapshot, like `exit_on_yank`.
+pub fn resolve_palette() -> StylePalette {
+    load_global_config().map_or_else(
+        |_| StylePalette::default(),
+        |config| apply_colors(config.colors),
+    )
+}
+
+fn apply_colors(colors: ColorsConfig) -> StylePalette {
+    let mut palette = StylePalette::default();
+    apply_style(&mut palette.unmatched, colors.unmatched, "unmatched");
+    apply_style(&mut palette.matched, colors.matched, "match");
+    apply_style(&mut palette.label, colors.label, "label");
+    apply_style(&mut palette.selection, colors.selection, "selection");
+    apply_style(&mut palette.cursor, colors.cursor, "cursor");
+    palette
+}
+
+fn apply_style(spec: &mut StyleSpec, over: Option<StyleOverride>, name: &str) {
+    let Some(over) = over else { return };
+    apply_channel(&mut spec.fg, over.fg, name, "fg");
+    apply_channel(&mut spec.bg, over.bg, name, "bg");
+    if let Some(bold) = over.bold {
+        spec.bold = bold;
+    }
+}
+
+fn apply_channel(channel: &mut Option<[u8; 3]>, value: Option<String>, name: &str, key: &str) {
+    match value.as_deref() {
+        None => {}
+        Some("none") => *channel = None,
+        Some(hex) => match parse_hex_color(hex) {
+            Some(rgb) => *channel = Some(rgb),
+            None => eprintln!(
+                "Herdr Flash: ignoring [colors] {name}.{key} = {hex:?}; expected \"#rrggbb\" or \"none\""
+            ),
+        },
+    }
+}
+
+/// Parses `#rrggbb` (case-insensitive). Anything else is rejected.
+fn parse_hex_color(value: &str) -> Option<[u8; 3]> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let parse = |range| u8::from_str_radix(hex.get(range)?, 16).ok();
+    Some([parse(0..2)?, parse(2..4)?, parse(4..6)?])
 }
 
 /// Resolves picker pattern specs before launching the temporary picker pane.
@@ -205,6 +278,42 @@ fn ancestors_until<'a>(cwd: &'a Path, root: &'a Path) -> impl Iterator<Item = &'
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_colors_parse_and_reject_garbage() {
+        assert_eq!(parse_hex_color("#ff007c"), Some([0xff, 0x00, 0x7c]));
+        assert_eq!(parse_hex_color("#FF007C"), Some([0xff, 0x00, 0x7c]));
+        assert_eq!(parse_hex_color("ff007c"), None);
+        assert_eq!(parse_hex_color("#f07"), None);
+        assert_eq!(parse_hex_color("#ff007g"), None);
+    }
+
+    #[test]
+    fn color_overrides_layer_onto_the_default_palette() {
+        let colors: ColorsConfig = toml::from_str(
+            r##"
+            match = { fg = "#010203", bg = "none" }
+            label = { bold = false }
+            unmatched = { fg = "not-a-color" }
+            "##,
+        )
+        .unwrap();
+
+        let palette = apply_colors(colors);
+        let defaults = StylePalette::default();
+
+        // match: fg overridden, bg explicitly cleared with "none".
+        assert_eq!(palette.matched.fg, Some([1, 2, 3]));
+        assert_eq!(palette.matched.bg, None);
+        // label: only bold flipped; colors keep their defaults.
+        assert_eq!(palette.label.bg, defaults.label.bg);
+        assert!(!palette.label.bold);
+        // invalid hex warns and keeps the default rather than blanking the style.
+        assert_eq!(palette.unmatched.fg, defaults.unmatched.fg);
+        // untouched styles stay identical.
+        assert_eq!(palette.cursor, defaults.cursor);
+        assert_eq!(palette.selection, defaults.selection);
+    }
 
     #[test]
     fn config_file_uses_default_priority_and_project_settings() {

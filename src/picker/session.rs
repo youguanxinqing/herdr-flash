@@ -1,6 +1,6 @@
 use crate::clipboard::{Clipboard, SystemClipboard};
 use crate::model::{
-    PickerAction, PickerOutcome, PickerSnapshot, RenderLine, RenderSpan, RenderStyle,
+    PickerAction, PickerOutcome, PickerSnapshot, RenderLine, RenderSpan, RenderStyle, StylePalette,
 };
 use crate::picker::copy::copy_selected_text;
 use crate::picker::input::{
@@ -40,7 +40,7 @@ where
 {
     let view = build_picker_view(snapshot);
     terminal::clear_screen(output)?;
-    terminal::emit_render_lines(output, &view.lines)?;
+    terminal::emit_render_lines(output, &view.lines, &snapshot.palette)?;
     output.flush()?;
 
     let Some(width) = view.assignments.width() else {
@@ -71,7 +71,13 @@ where
                     }
                 };
                 if let Err(error) = outcome {
-                    emit_selection_failure(output, snapshot.action, text, &error)?;
+                    emit_selection_failure(
+                        output,
+                        snapshot.action,
+                        text,
+                        &error,
+                        &snapshot.palette,
+                    )?;
                     return Err(error);
                 }
                 return outcome;
@@ -99,6 +105,7 @@ fn emit_selection_failure(
     action: PickerAction,
     text: &str,
     error: &anyhow::Error,
+    palette: &StylePalette,
 ) -> Result<()> {
     let verb = match action {
         PickerAction::Copy | PickerAction::Flash => "copy",
@@ -114,7 +121,7 @@ fn emit_selection_failure(
     // The failure note is a single line; wipe the hint frame it would otherwise sit on top of.
     // This is an exit path, so the clear cannot flicker a live render loop.
     terminal::clear_screen(output)?;
-    terminal::emit_render_lines(output, &lines)?;
+    terminal::emit_render_lines(output, &lines, palette)?;
     output.flush()?;
     Ok(())
 }
@@ -123,7 +130,9 @@ fn emit_selection_failure(
 mod tests {
     use super::*;
     use crate::clipboard::{ClipboardError, CopySuccess};
-    use crate::model::{PaneId, PaneTextCaptureMode, PickerReturnContext, SourcePaneSnapshot};
+    use crate::model::{
+        PaneId, PaneTextCaptureMode, PickerReturnContext, SourcePaneSnapshot, StylePalette,
+    };
     use crate::url_opener::{OpenUrlSuccess, UrlOpenError};
     use std::cell::RefCell;
 
@@ -207,6 +216,7 @@ mod tests {
             action: PickerAction::Copy,
             custom_patterns: Vec::new(),
             flash_exit_on_yank: true,
+            palette: StylePalette::default(),
         }
     }
 

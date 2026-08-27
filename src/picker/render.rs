@@ -107,7 +107,7 @@ pub fn run_readonly_picker(snapshot: &PickerSnapshot) -> Result<PickerOutcome> {
     let mut stdout = io::stdout();
     let _cursor = CursorGuard::hide()?;
     terminal::clear_screen(&mut stdout)?;
-    terminal::emit_render_lines(&mut stdout, &view.lines)?;
+    terminal::emit_render_lines(&mut stdout, &view.lines, &snapshot.palette)?;
     stdout.flush()?;
 
     enable_raw_mode().context("failed to enable raw mode for readonly picker")?;
@@ -170,7 +170,9 @@ fn fit_to_width(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PaneId, PaneTextCaptureMode, PickerReturnContext, SourcePaneSnapshot};
+    use crate::model::{
+        PaneId, PaneTextCaptureMode, PickerReturnContext, SourcePaneSnapshot, StylePalette,
+    };
 
     fn snapshot(lines: Vec<&str>, width: u16, height: u16) -> PickerSnapshot {
         PickerSnapshot {
@@ -193,6 +195,7 @@ mod tests {
             action: PickerAction::Copy,
             custom_patterns: Vec::new(),
             flash_exit_on_yank: true,
+            palette: StylePalette::default(),
         }
     }
 

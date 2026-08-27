@@ -185,6 +185,9 @@ pub struct PickerSnapshot {
     /// Whether a flash yank closes the picker; `[flash] exit_on_yank` in plugin config.
     #[serde(default = "default_flash_exit_on_yank")]
     pub flash_exit_on_yank: bool,
+    /// Picker colors; `[colors]` in plugin config overrides the defaults per style.
+    #[serde(default)]
+    pub palette: StylePalette,
 }
 
 fn default_flash_exit_on_yank() -> bool {
@@ -275,6 +278,62 @@ pub enum RenderStyle {
     Selection,
     /// The movable end of a selection; must stay distinct from the selection body.
     Cursor,
+}
+
+/// One resolved terminal style: truecolor channels plus bold. `None` keeps the terminal default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyleSpec {
+    pub fg: Option<[u8; 3]>,
+    pub bg: Option<[u8; 3]>,
+    #[serde(default)]
+    pub bold: bool,
+}
+
+/// Resolved picker colors, one spec per [`RenderStyle`].
+///
+/// Resolved from `[colors]` in plugin config by the action process and carried in the snapshot —
+/// the picker pane cannot read config itself, the same constraint `flash_exit_on_yank` lives under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StylePalette {
+    pub unmatched: StyleSpec,
+    pub matched: StyleSpec,
+    pub label: StyleSpec,
+    pub selection: StyleSpec,
+    pub cursor: StyleSpec,
+}
+
+impl Default for StylePalette {
+    /// The flash.nvim look: matches white-on-blue, labels white-on-magenta, and surrounding text
+    /// a grey that stays readable instead of sinking into a dark theme the way DarkGrey+Dim did.
+    fn default() -> Self {
+        Self {
+            unmatched: StyleSpec {
+                fg: Some([0x7a, 0x82, 0x94]),
+                bg: None,
+                bold: false,
+            },
+            matched: StyleSpec {
+                fg: Some([0xff, 0xff, 0xff]),
+                bg: Some([0x3e, 0x68, 0xd7]),
+                bold: false,
+            },
+            label: StyleSpec {
+                fg: Some([0xff, 0xff, 0xff]),
+                bg: Some([0xff, 0x00, 0x7c]),
+                bold: true,
+            },
+            selection: StyleSpec {
+                fg: None,
+                bg: Some([0x4d, 0x3a, 0x4a]),
+                bold: false,
+            },
+            cursor: StyleSpec {
+                fg: Some([0x00, 0x00, 0x00]),
+                bg: Some([0xff, 0xff, 0xff]),
+                bold: false,
+            },
+        }
+    }
 }
 
 /// A contiguous span of text to render in the picker, with a single style.
