@@ -39,8 +39,7 @@ where
     W: Write,
 {
     let view = build_picker_view(snapshot);
-    terminal::clear_screen(output)?;
-    terminal::emit_render_lines(output, &view.lines, &snapshot.palette)?;
+    terminal::emit_render_lines(output, &view.lines, &snapshot.palette, true)?;
     output.flush()?;
 
     let Some(width) = view.assignments.width() else {
@@ -118,10 +117,8 @@ fn emit_selection_failure(
             style: RenderStyle::Unmatched,
         }],
     }];
-    // The failure note is a single line; wipe the hint frame it would otherwise sit on top of.
-    // This is an exit path, so the clear cannot flicker a live render loop.
-    terminal::clear_screen(output)?;
-    terminal::emit_render_lines(output, &lines, palette)?;
+    // The failure note is a single line; the folded-in clear wipes the hint frame under it.
+    terminal::emit_render_lines(output, &lines, palette, true)?;
     output.flush()?;
     Ok(())
 }

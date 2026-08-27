@@ -12,20 +12,24 @@ use std::io::Write;
 
 /// Emits abstract picker render lines to a terminal writer using v1 styling.
 ///
-/// Frames never clear the screen, because a clear-then-repaint shows a blank frame whenever the
-/// terminal composites between the two, and the DEC 2026 guards that were meant to prevent that
-/// are best-effort — Herdr drops them under its render timeout. The caller therefore owns
-/// coverage: a repaint loop must paint full-width rows for the whole frame so overwriting in
-/// place is complete; a one-shot emit that covers less must `clear_screen` first. The frame is
-/// also assembled in memory and handed over as one write, keeping a mid-write composite down to
-/// a soft tear.
+/// Repaint frames never clear the screen, because a clear-then-repaint shows a blank frame
+/// whenever the terminal composites between the two, and the DEC 2026 guards that were meant to
+/// prevent that are best-effort — Herdr drops them under its render timeout. The caller owns
+/// coverage: a repaint loop must paint every cell of the frame so overwriting in place is
+/// complete; a one-shot emit that covers less passes `clear_first`, which rides the clear inside
+/// the same buffered write as the content so a bare cleared screen can never be composited
+/// alone. The frame is assembled in memory and handed over as one write for the same reason.
 pub fn emit_render_lines(
     writer: &mut impl Write,
     lines: &[RenderLine],
     palette: &StylePalette,
+    clear_first: bool,
 ) -> Result<()> {
     let mut frame = Vec::new();
     queue!(frame, BeginSynchronizedUpdate)?;
+    if clear_first {
+        queue!(frame, Clear(ClearType::All))?;
+    }
 
     for (line_index, line) in lines.iter().enumerate() {
         queue!(frame, MoveTo(0, line_index as u16))?;
@@ -44,12 +48,6 @@ pub fn emit_render_lines(
         EndSynchronizedUpdate
     )?;
     writer.write_all(&frame)?;
-    Ok(())
-}
-
-/// Clears the whole screen. Entry-time only: a clear inside the render loop is a flicker.
-pub fn clear_screen(writer: &mut impl Write) -> Result<()> {
-    queue!(writer, Clear(ClearType::All))?;
     Ok(())
 }
 
@@ -108,7 +106,7 @@ mod tests {
         }];
         let mut output = Vec::new();
 
-        emit_render_lines(&mut output, &lines, &StylePalette::default()).unwrap();
+        emit_render_lines(&mut output, &lines, &StylePalette::default(), false).unwrap();
         let output = String::from_utf8(output).unwrap();
 
         assert!(output.starts_with("\u{1b}[?2026h\u{1b}[1;1H"));
@@ -140,7 +138,7 @@ mod tests {
         }];
         let mut output = Vec::new();
 
-        emit_render_lines(&mut output, &lines, &StylePalette::default()).unwrap();
+        emit_render_lines(&mut output, &lines, &StylePalette::default(), false).unwrap();
         let output = String::from_utf8(output).unwrap();
 
         let hint_bg = output
@@ -175,7 +173,7 @@ mod tests {
         ];
         let mut output = Vec::new();
 
-        emit_render_lines(&mut output, &lines, &StylePalette::default()).unwrap();
+        emit_render_lines(&mut output, &lines, &StylePalette::default(), false).unwrap();
         let output = String::from_utf8(output).unwrap();
 
         assert!(output.contains("\u{1b}[1;1H"));
@@ -185,10 +183,22 @@ mod tests {
     }
 
     #[test]
-    fn clear_screen_emits_a_full_clear() {
+    fn a_one_shot_emit_folds_the_clear_into_the_synchronized_frame() {
+        force_colors();
+        let lines = vec![RenderLine {
+            spans: vec![RenderSpan {
+                text: "note".to_string(),
+                style: RenderStyle::Unmatched,
+            }],
+        }];
         let mut output = Vec::new();
-        clear_screen(&mut output).unwrap();
-        assert_eq!(String::from_utf8(output).unwrap(), "\u{1b}[2J");
+
+        emit_render_lines(&mut output, &lines, &StylePalette::default(), true).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        // The clear must ride inside the same guarded frame, never reach the pty on its own.
+        assert!(output.starts_with("\u{1b}[?2026h\u{1b}[2J"));
+        assert!(output.contains("note"));
     }
 
     #[test]
@@ -208,7 +218,7 @@ mod tests {
         }];
         let mut output = Vec::new();
 
-        emit_render_lines(&mut output, &lines, &palette).unwrap();
+        emit_render_lines(&mut output, &lines, &palette, false).unwrap();
         let output = String::from_utf8(output).unwrap();
 
         assert!(output.contains("\u{1b}[48;2;1;2;3m"));

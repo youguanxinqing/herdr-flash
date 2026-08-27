@@ -48,10 +48,9 @@ where
     let mut pending_char: Option<CharMotion> = None;
     let mut notice: Option<String> = None;
 
-    // Wipe whatever the pane held exactly once. Frames only overwrite from here on: a per-frame
-    // clear is the blank flash the pane's compositor occasionally catches mid-write.
-    terminal::clear_screen(output)?;
-
+    // No entry clear: every frame is fitted to the live terminal size and paints every cell, so
+    // the first frame already covers whatever the fresh pane held. A separate clear reaches the
+    // pty as its own write, and the bare cleared screen composites as a visible blank blink.
     loop {
         let candidates = find_query_matches(&viewport.logical_lines, &query);
         let labels = assign_labels(&viewport.logical_lines, &candidates);
@@ -75,7 +74,7 @@ where
             None => prompt_line(&labels, &query, notice.as_deref(), cols),
         };
         let lines = compose_frame(content, status, cols, rows);
-        terminal::emit_render_lines(output, &lines, &snapshot.palette)?;
+        terminal::emit_render_lines(output, &lines, &snapshot.palette, false)?;
         output.flush()?;
 
         let event = input.read_event()?;

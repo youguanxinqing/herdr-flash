@@ -1,6 +1,6 @@
 id = "youguanxinqing.herdr-flash"
 name = "Herdr Flash"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.7.4"
 description = "flash.nvim-style incremental search, vim-motion selection, and yank over visible Herdr pane text"
 platforms = ["linux", "macos"]
