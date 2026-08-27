@@ -9,9 +9,7 @@ mod socket;
 use crate::config::{resolve_flash_exit_on_yank, resolve_palette, resolve_pattern_specs};
 use crate::herdr::client::SocketHerdrClient;
 use crate::herdr::context::HerdrContext;
-use crate::herdr::executor::{
-    cleanup_session, launch_layout_tab_picker, run_snapshot_picker, zoom_picker,
-};
+use crate::herdr::executor::{cleanup_session, launch_layout_tab_picker, run_snapshot_picker};
 use crate::herdr::snapshot::{read_snapshot_file, wait_for_ready, PickerLaunchFiles};
 use crate::model::{PaneId, PickerAction};
 use anyhow::{bail, Context, Result};
@@ -86,38 +84,40 @@ impl HerdrAdapter {
     }
 
     /// Waits for layout completion, runs the picker, and always cleans up explicit resources.
-    pub fn run_picker_from_snapshot(&self, snapshot_path: &Path, ready_path: &Path) -> Result<()> {
+    pub fn run_picker_from_snapshot(
+        &self,
+        snapshot_path: &Path,
+        ready_path: &Path,
+        painted_path: &Path,
+    ) -> Result<()> {
         let snapshot = read_snapshot_file(snapshot_path)?;
+        let files = PickerLaunchFiles::from_paths(
+            snapshot_path.to_path_buf(),
+            ready_path.to_path_buf(),
+            painted_path.to_path_buf(),
+        );
+        // layout.apply keeps this tab hidden. Wait for Herdr's asynchronous PTY resize, paint the
+        // complete first frame, then tell the action process it can switch tabs without exposing
+        // an empty or mis-sized pane. Preview failure remains best-effort so launch can fall back.
+        let preview = wait_for_terminal_size(
+            snapshot.picker.content_width,
+            snapshot.picker.content_height,
+            Duration::from_millis(250),
+        )
+        .and_then(|_| crate::picker::paint_entry_preview(&snapshot));
+        if let Err(error) = preview {
+            eprintln!("Herdr Flash: entry preview failed: {error:#}");
+        }
+        if let Err(error) = files.signal_painted() {
+            eprintln!("Herdr Flash: failed to signal entry preview: {error:#}");
+        }
         let temp_tab = self
             .context
             .tab_id
             .clone()
             .context("picker process is missing HERDR_TAB_ID")?;
-        let pane = self
-            .context
-            .pane_id
-            .clone()
-            .map(PaneId::new)
-            .context("picker process is missing HERDR_PANE_ID")?;
-        let files = PickerLaunchFiles {
-            snapshot_path: snapshot_path.to_path_buf(),
-            ready_path: ready_path.to_path_buf(),
-            marker_temp_path: ready_path.with_extension("ready.tmp"),
-        };
         let mut client = SocketHerdrClient::from_context(&self.context)?;
         let primary = wait_for_ready(ready_path, Duration::from_secs(10))
-            .and_then(|_| zoom_picker(&mut client, &snapshot, &pane))
-            .and_then(|_| {
-                if snapshot.session.zoom_picker {
-                    wait_for_terminal_size(
-                        snapshot.source.target_content_width,
-                        snapshot.source.target_content_height,
-                        Duration::from_secs(2),
-                    )
-                } else {
-                    Ok(())
-                }
-            })
             .and_then(|_| run_snapshot_picker(&snapshot));
         let cleanup = cleanup_session(&mut client, &snapshot.session, &temp_tab);
         let files_cleanup = files.cleanup();

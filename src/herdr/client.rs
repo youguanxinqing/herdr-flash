@@ -40,14 +40,13 @@ pub struct AppliedLayout {
 pub trait HerdrClient {
     fn pane_layout(&mut self, pane: &PaneId) -> Result<LayoutSnapshot>;
     fn pane_read_visible(&mut self, pane: &PaneId, lines: u16) -> Result<String>;
-    fn apply_layout(
+    fn apply_hidden_layout(
         &mut self,
         workspace_id: &str,
         tab_label: &str,
         root: &LaunchLayoutNode,
     ) -> Result<AppliedLayout>;
     fn focus_pane(&mut self, pane: &PaneId) -> Result<()>;
-    fn zoom_pane(&mut self, pane: &PaneId) -> Result<()>;
     fn focus_tab(&mut self, tab_id: &str) -> Result<()>;
     fn close_tab(&mut self, tab_id: &str) -> Result<()>;
 }
@@ -95,7 +94,7 @@ impl HerdrClient for SocketHerdrClient {
         protocol::pane_read(value, &id)
     }
 
-    fn apply_layout(
+    fn apply_hidden_layout(
         &mut self,
         workspace_id: &str,
         tab_label: &str,
@@ -115,11 +114,6 @@ impl HerdrClient for SocketHerdrClient {
     fn focus_pane(&mut self, pane: &PaneId) -> Result<()> {
         let (id, value) = self.call("pane.focus", protocol::pane_target(&pane.0))?;
         protocol::pane_focused(value, &id)
-    }
-
-    fn zoom_pane(&mut self, pane: &PaneId) -> Result<()> {
-        let (id, value) = self.call("pane.zoom", protocol::pane_zoom_params(&pane.0))?;
-        protocol::pane_zoomed(value, &id)
     }
 
     fn focus_tab(&mut self, tab_id: &str) -> Result<()> {

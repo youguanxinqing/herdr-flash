@@ -60,20 +60,17 @@ where
         // row; columns bound every emitted row, because frames overwrite in place instead of
         // clearing: a row wider than the pane would wrap and corrupt the frame, and one narrower
         // would leave stale cells at the right edge.
-        let (cols, rows) = crossterm::terminal::size()
-            .map_or((width as usize, height as usize), |(cols, rows)| {
-                (cols as usize, rows as usize)
-            });
-        let (cols, rows) = (cols.max(1), rows.max(1));
+        let (cols, rows) = live_grid(width, height);
         let content = match &selection {
             Some(active) => render_selection(&viewport, active, width, height),
             None => render_flash_labels(&viewport, &labels, width, height),
         };
+        let source_cols = width as usize;
         let status = match &selection {
-            Some(active) => legend_line(active, &query, cols),
-            None => prompt_line(&labels, &query, notice.as_deref(), cols),
+            Some(active) => legend_line(active, &query, source_cols),
+            None => prompt_line(&labels, &query, notice.as_deref(), source_cols),
         };
-        let lines = compose_frame(content, status, cols, rows);
+        let lines = compose_frame(content, status, source_cols, cols, rows);
         terminal::emit_render_lines(output, &lines, &snapshot.palette, false)?;
         output.flush()?;
 
@@ -135,6 +132,40 @@ where
             PickerInputEvent::Other => continue,
         }
     }
+}
+
+/// Paints the initial search frame — empty query, no selection — for the entry preview.
+///
+/// Runs before the launch barrier, so it must not touch input or terminal modes; it only writes
+/// the same frame the interactive loop would paint first, fitted to the live terminal size.
+pub(crate) fn emit_entry_preview<W: Write>(
+    snapshot: &PickerSnapshot,
+    output: &mut W,
+) -> Result<()> {
+    let width = snapshot.source.target_content_width;
+    let height = snapshot.source.target_content_height;
+    let viewport = snapshot.source.visible_viewport.clone().unwrap_or_else(|| {
+        map_visible_viewport(snapshot.source.logical_lines.clone(), width, height)
+    });
+    let candidates = find_query_matches(&viewport.logical_lines, "");
+    let labels = assign_labels(&viewport.logical_lines, &candidates);
+    let (cols, rows) = live_grid(width, height);
+    let content = render_flash_labels(&viewport, &labels, width, height);
+    let source_cols = width as usize;
+    let status = prompt_line(&labels, "", None, source_cols);
+    let lines = compose_frame(content, status, source_cols, cols, rows);
+    terminal::emit_render_lines(output, &lines, &snapshot.palette, false)?;
+    output.flush()?;
+    Ok(())
+}
+
+/// Live terminal size in cells, falling back to the snapshot's dimensions, never zero.
+fn live_grid(width: u16, height: u16) -> (usize, usize) {
+    let (cols, rows) = crossterm::terminal::size()
+        .map_or((width as usize, height as usize), |(cols, rows)| {
+            (cols as usize, rows as usize)
+        });
+    (cols.max(1), rows.max(1))
 }
 
 enum SelectStep {
@@ -225,25 +256,63 @@ fn select_step(
 }
 
 /// Lays the frame out against the live terminal: every row is clipped or padded to exactly
-/// `cols`, the body is padded or trimmed to fill all but the last of `rows`, and the status row
-/// is pinned to the bottom. Exact coverage is what lets frames overwrite without clearing.
+/// `live_cols`, spare columns around the captured source become a one-cell horizontal inset, the
+/// body fills all but the last of `live_rows`, and the status row is pinned to the bottom. Exact
+/// coverage is what lets frames overwrite without clearing.
 fn compose_frame(
     content: Vec<RenderLine>,
     status: RenderLine,
-    cols: usize,
-    rows: usize,
+    source_cols: usize,
+    live_cols: usize,
+    live_rows: usize,
 ) -> Vec<RenderLine> {
-    let body = rows.saturating_sub(1);
-    let mut lines: Vec<RenderLine> = content
-        .into_iter()
-        .take(body)
-        .map(|line| fit_row(line, cols))
-        .collect();
-    while lines.len() < body {
-        lines.push(blank_row(cols));
+    let body = live_rows.saturating_sub(1);
+    // A zoomed source loses border rows when it becomes a single-pane picker, leaving one row
+    // beyond the captured content and status. Spend that slack above the content instead of below
+    // it: the top breathes without hiding another searchable source row in tight pane layouts.
+    let top_padding = usize::from(content.len() < body);
+    // A single-pane picker similarly recovers the source pane's two border columns. Put one on
+    // each side; if both do not fit, keep the captured content at full available width.
+    let has_side_padding = source_cols.saturating_add(2) <= live_cols;
+    let mut lines = Vec::with_capacity(live_rows);
+    if top_padding == 1 {
+        lines.push(blank_row(live_cols));
     }
-    lines.push(fit_row(status, cols));
+    lines.extend(
+        content
+            .into_iter()
+            .take(body.saturating_sub(top_padding))
+            .map(|line| fit_row_with_side_padding(line, live_cols, has_side_padding)),
+    );
+    while lines.len() < body {
+        lines.push(blank_row(live_cols));
+    }
+    lines.push(fit_row_with_side_padding(
+        status,
+        live_cols,
+        has_side_padding,
+    ));
     lines
+}
+
+/// Fits a source row to the live pane while optionally reserving one cell on each side.
+fn fit_row_with_side_padding(line: RenderLine, live_cols: usize, has_padding: bool) -> RenderLine {
+    if !has_padding {
+        return fit_row(line, live_cols);
+    }
+
+    let inner = fit_row(line, live_cols.saturating_sub(2)).spans;
+    let mut spans = Vec::with_capacity(inner.len() + 2);
+    spans.push(RenderSpan {
+        text: " ".to_string(),
+        style: RenderStyle::Unmatched,
+    });
+    spans.extend(inner);
+    spans.push(RenderSpan {
+        text: " ".to_string(),
+        style: RenderStyle::Unmatched,
+    });
+    RenderLine { spans }
 }
 
 /// Re-fits an already-rendered row to the live column count, clipping or padding as needed.
@@ -352,8 +421,8 @@ mod tests {
     use super::*;
     use crate::clipboard::{ClipboardError, CopySuccess};
     use crate::model::{
-        PaneId, PaneTextCaptureMode, PickerAction, PickerReturnContext, SourcePaneSnapshot,
-        StylePalette,
+        PaneId, PaneTextCaptureMode, PickerAction, PickerPaneSnapshot, PickerReturnContext,
+        SourcePaneSnapshot, StylePalette,
     };
     use anyhow::anyhow;
     use std::cell::RefCell;
@@ -405,16 +474,23 @@ mod tests {
                 visible_viewport: None,
                 capture_mode: PaneTextCaptureMode::ExactVisibleUnwrapped,
             },
+            picker: PickerPaneSnapshot {
+                content_width: width,
+                content_height: height,
+            },
             session: PickerReturnContext {
                 return_tab_id: "t1".to_string(),
                 return_pane_id: PaneId::new("p1"),
-                zoom_picker: false,
             },
             action: PickerAction::Flash,
             custom_patterns: Vec::new(),
             flash_exit_on_yank: true,
             palette: StylePalette::default(),
         }
+    }
+
+    fn line_text(line: &RenderLine) -> String {
+        line.spans.iter().map(|span| span.text.as_str()).collect()
     }
 
     fn run(events: Vec<PickerInputEvent>, lines: Vec<&str>) -> (PickerOutcome, Vec<String>) {
@@ -546,13 +622,57 @@ mod tests {
         let status = fill_row(vec![("S".to_string(), RenderStyle::Hint)], 4);
         let content = vec![blank_row(4); 3];
 
-        let taller = compose_frame(content.clone(), status.clone(), 4, 6);
+        let taller = compose_frame(content.clone(), status.clone(), 4, 4, 6);
         assert_eq!(taller.len(), 6);
         assert_eq!(taller[5].spans[0].text, "S");
 
-        let shorter = compose_frame(content, status, 4, 2);
+        let shorter = compose_frame(content, status, 4, 4, 2);
         assert_eq!(shorter.len(), 2);
         assert_eq!(shorter[1].spans[0].text, "S");
+    }
+
+    #[test]
+    fn spare_picker_height_becomes_one_top_padding_row() {
+        let content = vec![
+            fill_row(vec![("A".to_string(), RenderStyle::Unmatched)], 4),
+            fill_row(vec![("B".to_string(), RenderStyle::Unmatched)], 4),
+        ];
+        let status = fill_row(vec![("S".to_string(), RenderStyle::Hint)], 4);
+
+        let padded = compose_frame(content.clone(), status.clone(), 4, 4, 4);
+        assert_eq!(padded[0], blank_row(4));
+        assert_eq!(padded[1].spans[0].text, "A");
+        assert_eq!(padded[3].spans[0].text, "S");
+
+        let tight = compose_frame(content, status, 4, 4, 3);
+        assert_eq!(tight[0].spans[0].text, "A");
+        assert_eq!(tight[2].spans[0].text, "S");
+    }
+
+    #[test]
+    fn spare_picker_width_becomes_one_padding_column_on_each_side() {
+        let content = vec![fill_row(vec![("A".to_string(), RenderStyle::Unmatched)], 4)];
+        let status = fill_row(vec![("S".to_string(), RenderStyle::Hint)], 4);
+
+        let padded = compose_frame(content.clone(), status.clone(), 4, 6, 2);
+        assert_eq!(line_text(&padded[0]), " A    ");
+        assert_eq!(line_text(&padded[1]), " S    ");
+
+        let tight = compose_frame(content, status_row("", "", 4), 4, 5, 2);
+        assert_eq!(line_text(&tight[0]), "A    ");
+    }
+
+    #[test]
+    fn the_entry_preview_paints_the_initial_search_frame() {
+        let mut output = Vec::new();
+        emit_entry_preview(&snapshot(vec!["run cargo test"], 40, 3), &mut output).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+
+        assert!(rendered.contains("run cargo test"));
+        assert!(rendered.contains("type to search"));
+        // The preview is an overwrite frame like any other: a clear here would be the entry
+        // blink all over again.
+        assert!(!rendered.contains("\u{1b}[2J"));
     }
 
     #[test]
@@ -563,13 +683,11 @@ mod tests {
 
         // Live pane is 4 columns: the wide row must clip, the narrow one must pad, or an
         // uncleared frame would wrap into the next row / leave stale cells at the right edge.
-        let lines = compose_frame(vec![wide, narrow], status, 4, 3);
+        let lines = compose_frame(vec![wide, narrow], status, 6, 4, 3);
         for line in &lines {
-            let rendered: String = line.spans.iter().map(|span| span.text.as_str()).collect();
-            assert_eq!(crate::hints::display_width(&rendered), 4);
+            assert_eq!(crate::hints::display_width(&line_text(line)), 4);
         }
-        let first: String = lines[0].spans.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(first, "abcd");
+        assert_eq!(line_text(&lines[0]), "abcd");
     }
 
     #[test]
@@ -834,7 +952,7 @@ mod tests {
             20,
         );
 
-        let rendered: String = row.spans.iter().map(|span| span.text.as_str()).collect();
+        let rendered = line_text(&row);
         assert_eq!(crate::hints::display_width(&rendered), 20);
         assert!(rendered.starts_with(" flash "));
         assert!(rendered.contains('x'), "the query must survive truncation");

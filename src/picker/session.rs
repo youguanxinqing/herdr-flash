@@ -128,7 +128,8 @@ mod tests {
     use super::*;
     use crate::clipboard::{ClipboardError, CopySuccess};
     use crate::model::{
-        PaneId, PaneTextCaptureMode, PickerReturnContext, SourcePaneSnapshot, StylePalette,
+        PaneId, PaneTextCaptureMode, PickerPaneSnapshot, PickerReturnContext, SourcePaneSnapshot,
+        StylePalette,
     };
     use crate::url_opener::{OpenUrlSuccess, UrlOpenError};
     use std::cell::RefCell;
@@ -205,10 +206,13 @@ mod tests {
                 visible_viewport: None,
                 capture_mode: PaneTextCaptureMode::RecentUnwrappedBottomApproximation,
             },
+            picker: PickerPaneSnapshot {
+                content_width: width,
+                content_height: height,
+            },
             session: PickerReturnContext {
                 return_tab_id: "t1".to_string(),
                 return_pane_id: PaneId::new("p1"),
-                zoom_picker: false,
             },
             action: PickerAction::Copy,
             custom_patterns: Vec::new(),

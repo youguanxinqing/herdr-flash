@@ -109,6 +109,13 @@ command = "youguanxinqing.herdr-flash.flash"
 description = "flash: search visible text, then select and yank"
 ```
 
+## Engineering notes
+
+Complex regressions and the invariants that prevent them are recorded in
+[`docs/bugs/`](docs/bugs/README.md). In particular, the
+[Flash picker entry blink](docs/bugs/flash-picker-entry-blink.md) documents the hidden-tab paint
+handshake and the source-versus-picker geometry split.
+
 ## Credits
 
 - [flash.nvim](https://github.com/folke/flash.nvim) by folke — the interaction model this plugin is an homage to: search-driven navigation with labeled jumps, where landing the cursor and choosing the text are separate acts.

@@ -48,9 +48,12 @@ pub enum Command {
         /// Temp JSON snapshot path produced by `open`.
         #[arg(long)]
         snapshot: PathBuf,
-        /// One-shot launch barrier released after layout application.
+        /// One-shot launch barrier released after the painted tab receives focus.
         #[arg(long)]
         ready: PathBuf,
+        /// One-shot marker published after the hidden tab paints its first frame.
+        #[arg(long)]
+        painted: PathBuf,
     },
 
     /// Internal shell-free placeholder for non-picker panes.
@@ -78,8 +81,12 @@ pub fn run_with(cli: Cli) -> Result<()> {
             let target = resolve_target(&adapter, target_pane)?;
             adapter.open_flash_picker(&target)?;
         }
-        Command::Pick { snapshot, ready } => {
-            adapter.run_picker_from_snapshot(&snapshot, &ready)?;
+        Command::Pick {
+            snapshot,
+            ready,
+            painted,
+        } => {
+            adapter.run_picker_from_snapshot(&snapshot, &ready, &painted)?;
         }
         Command::Idle => crate::herdr::run_idle()?,
     }

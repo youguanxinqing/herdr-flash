@@ -144,12 +144,18 @@ pub struct LogicalLineVisualSegment {
     pub col_end: usize,
 }
 
-/// Source location and zoom state restored after picker completion.
+/// Source location restored after picker completion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickerReturnContext {
     pub return_tab_id: String,
     pub return_pane_id: PaneId,
-    pub zoom_picker: bool,
+}
+
+/// Final hidden-picker content size, distinct from the captured source content size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickerPaneSnapshot {
+    pub content_width: u16,
+    pub content_height: u16,
 }
 
 /// Serializable regex pattern config resolved before the picker pane starts.
@@ -177,6 +183,7 @@ pub enum PickerAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickerSnapshot {
     pub source: SourcePaneSnapshot,
+    pub picker: PickerPaneSnapshot,
     pub session: PickerReturnContext,
     #[serde(default)]
     pub action: PickerAction,

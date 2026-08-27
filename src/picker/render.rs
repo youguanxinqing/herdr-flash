@@ -79,6 +79,20 @@ pub fn build_picker_view(snapshot: &PickerSnapshot) -> PickerView {
     }
 }
 
+/// Paints the hint view once for the entry preview, before the launch barrier releases.
+///
+/// The interactive picker emits the same view again when it starts; both are single buffered
+/// writes with the clear folded in, so neither can composite as a bare cleared screen.
+pub(crate) fn emit_entry_preview<W: std::io::Write>(
+    snapshot: &PickerSnapshot,
+    output: &mut W,
+) -> Result<()> {
+    let view = build_picker_view(snapshot);
+    terminal::emit_render_lines(output, &view.lines, &snapshot.palette, true)?;
+    output.flush()?;
+    Ok(())
+}
+
 /// Builds the production readonly picker view from captured pane text.
 pub fn build_readonly_picker_view(snapshot: &PickerSnapshot) -> ReadonlyPickerView {
     let view = build_picker_view(snapshot);
@@ -170,7 +184,8 @@ fn fit_to_width(text: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use crate::model::{
-        PaneId, PaneTextCaptureMode, PickerReturnContext, SourcePaneSnapshot, StylePalette,
+        PaneId, PaneTextCaptureMode, PickerPaneSnapshot, PickerReturnContext, SourcePaneSnapshot,
+        StylePalette,
     };
 
     fn snapshot(lines: Vec<&str>, width: u16, height: u16) -> PickerSnapshot {
@@ -186,10 +201,13 @@ mod tests {
                 visible_viewport: None,
                 capture_mode: PaneTextCaptureMode::RecentUnwrappedBottomApproximation,
             },
+            picker: PickerPaneSnapshot {
+                content_width: width,
+                content_height: height,
+            },
             session: PickerReturnContext {
                 return_tab_id: "t1".to_string(),
                 return_pane_id: PaneId::new("p1"),
-                zoom_picker: false,
             },
             action: PickerAction::Copy,
             custom_patterns: Vec::new(),

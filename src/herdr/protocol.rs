@@ -32,12 +32,6 @@ pub(crate) struct PaneReadParams<'a> {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct PaneZoomParams<'a> {
-    pane_id: &'a str,
-    mode: &'static str,
-}
-
-#[derive(Debug, Serialize)]
 pub(crate) struct LayoutApplyParams<'a> {
     workspace_id: &'a str,
     tab_label: &'a str,
@@ -121,12 +115,6 @@ enum PaneInfoResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum PaneZoomResult {
-    PaneZoom {},
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
 enum TabInfoResult {
     TabInfo {},
 }
@@ -159,13 +147,6 @@ pub(crate) fn pane_read_params(pane_id: &str, lines: u16) -> PaneReadParams<'_> 
     }
 }
 
-pub(crate) fn pane_zoom_params(pane_id: &str) -> PaneZoomParams<'_> {
-    PaneZoomParams {
-        pane_id,
-        mode: "on",
-    }
-}
-
 pub(crate) fn layout_apply_params<'a>(
     workspace_id: &'a str,
     tab_label: &'a str,
@@ -174,7 +155,7 @@ pub(crate) fn layout_apply_params<'a>(
     LayoutApplyParams {
         workspace_id,
         tab_label,
-        focus: true,
+        focus: false,
         root: WireLayoutNode::from(root),
     }
 }
@@ -193,10 +174,6 @@ pub(crate) fn pane_read(value: Value, id: &str) -> Result<String> {
 
 pub(crate) fn pane_focused(value: Value, id: &str) -> Result<()> {
     decode::<PaneInfoResult>(value, id).map(|_| ())
-}
-
-pub(crate) fn pane_zoomed(value: Value, id: &str) -> Result<()> {
-    decode::<PaneZoomResult>(value, id).map(|_| ())
 }
 
 pub(crate) fn tab_focused(value: Value, id: &str) -> Result<()> {
@@ -329,5 +306,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(applied, ("w:t2".into(), "w:p2".into()));
+    }
+
+    #[test]
+    fn picker_layout_is_created_without_stealing_focus() {
+        let root = LaunchLayoutNode::Pane {
+            command: vec!["flash".into(), "pick".into()],
+        };
+        let params = layout_apply_params("w1", "Flash", &root);
+        let encoded = serde_json::to_value(params).unwrap();
+
+        assert_eq!(encoded["focus"], false);
     }
 }

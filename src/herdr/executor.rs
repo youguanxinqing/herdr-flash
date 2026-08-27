@@ -1,6 +1,6 @@
 use crate::herdr::client::{HerdrClient, LaunchLayoutNode};
 use crate::herdr::layout::{derive_layout_recreation_plan, derive_source_geometry};
-use crate::herdr::snapshot::{build_source_snapshot, PickerLaunchFiles};
+use crate::herdr::snapshot::{build_source_snapshot, wait_for_painted, PickerLaunchFiles};
 use crate::model::{
     LayoutNode, PaneId, PatternSpec, PickerAction, PickerReturnContext, PickerSnapshot,
     StylePalette,
@@ -8,6 +8,9 @@ use crate::model::{
 use crate::viewport::map_visible_viewport;
 use anyhow::{bail, Context, Result};
 use std::path::Path;
+use std::time::Duration;
+
+const PAINTED_FRAME_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Captures source state and atomically applies the temporary picker layout.
 pub fn launch_layout_tab_picker<C: HerdrClient>(
@@ -20,8 +23,13 @@ pub fn launch_layout_tab_picker<C: HerdrClient>(
     palette: StylePalette,
 ) -> Result<()> {
     let layout = client.pane_layout(target)?;
-    let plan = derive_layout_recreation_plan(&layout, target)?;
     let geometry = derive_source_geometry(&layout, target);
+    let source_was_zoomed = layout.zoomed && layout_target_is_focused(&layout, target);
+    let plan = if source_was_zoomed {
+        None
+    } else {
+        Some(derive_layout_recreation_plan(&layout, target)?)
+    };
     let read_lines = geometry.source_content_rect.height;
 
     if read_lines == 0 {
@@ -42,7 +50,6 @@ pub fn launch_layout_tab_picker<C: HerdrClient>(
             .clone()
             .context("pane layout did not include return tab id")?,
         return_pane_id: target.clone(),
-        zoom_picker: layout.zoomed && layout_target_is_focused(&layout, target),
     };
 
     let snapshot = build_source_snapshot(
@@ -59,13 +66,25 @@ pub fn launch_layout_tab_picker<C: HerdrClient>(
 
     let files = PickerLaunchFiles::create(&snapshot)?;
 
-    let root = convert_layout(
-        &plan.root,
-        target,
-        binary_path,
-        &files.snapshot_path,
-        &files.ready_path,
-    );
+    let root = match plan {
+        Some(plan) => convert_layout(
+            &plan.root,
+            target,
+            binary_path,
+            &files.snapshot_path,
+            &files.ready_path,
+            &files.painted_path,
+        ),
+        // A zoomed source already occupies the full content area. Replaying its hidden split tree
+        // and zooming after focus creates a second visible resize; one picker pane has the same
+        // final geometry without that transition.
+        None => picker_layout_node(
+            binary_path,
+            &files.snapshot_path,
+            &files.ready_path,
+            &files.painted_path,
+        ),
+    };
 
     let workspace_id = layout
         .workspace_id
@@ -76,13 +95,20 @@ pub fn launch_layout_tab_picker<C: HerdrClient>(
         PickerAction::OpenUrl => "Herdr Flash: Open URL",
         PickerAction::Flash => "Herdr Flash",
     };
-    let applied = match client.apply_layout(workspace_id, tab_label, &root) {
+    let applied = match client.apply_hidden_layout(workspace_id, tab_label, &root) {
         Ok(value) => value,
         Err(error) => {
             let _ = files.cleanup();
             return Err(error);
         }
     };
+
+    // Keep the source tab visible until the hidden picker pane has both its final PTY geometry and
+    // a complete first frame. Timeout is deliberately best-effort: a failed preview must not make
+    // the action unusable.
+    if let Err(error) = wait_for_painted(&files.painted_path, PAINTED_FRAME_TIMEOUT) {
+        eprintln!("Herdr Flash: entry preview was not ready before focus: {error:#}");
+    }
 
     let focus_result = client.focus_pane(&applied.picker_pane_id);
 
@@ -107,19 +133,11 @@ fn convert_layout(
     binary: &Path,
     snapshot: &Path,
     ready: &Path,
+    painted: &Path,
 ) -> LaunchLayoutNode {
     match node {
         LayoutNode::Pane { source_pane_id, .. } if source_pane_id == target => {
-            LaunchLayoutNode::Pane {
-                command: vec![
-                    binary.to_string_lossy().into_owned(),
-                    "pick".into(),
-                    "--snapshot".into(),
-                    snapshot.to_string_lossy().into_owned(),
-                    "--ready".into(),
-                    ready.to_string_lossy().into_owned(),
-                ],
-            }
+            picker_layout_node(binary, snapshot, ready, painted)
         }
         LayoutNode::Pane { .. } => LaunchLayoutNode::Pane {
             command: vec![binary.to_string_lossy().into_owned(), "idle".into()],
@@ -133,9 +151,33 @@ fn convert_layout(
         } => LaunchLayoutNode::Split {
             direction: *direction,
             ratio: *ratio,
-            first: Box::new(convert_layout(first, target, binary, snapshot, ready)),
-            second: Box::new(convert_layout(second, target, binary, snapshot, ready)),
+            first: Box::new(convert_layout(
+                first, target, binary, snapshot, ready, painted,
+            )),
+            second: Box::new(convert_layout(
+                second, target, binary, snapshot, ready, painted,
+            )),
         },
+    }
+}
+
+fn picker_layout_node(
+    binary: &Path,
+    snapshot: &Path,
+    ready: &Path,
+    painted: &Path,
+) -> LaunchLayoutNode {
+    LaunchLayoutNode::Pane {
+        command: vec![
+            binary.to_string_lossy().into_owned(),
+            "pick".into(),
+            "--snapshot".into(),
+            snapshot.to_string_lossy().into_owned(),
+            "--ready".into(),
+            ready.to_string_lossy().into_owned(),
+            "--painted".into(),
+            painted.to_string_lossy().into_owned(),
+        ],
     }
 }
 
@@ -185,18 +227,6 @@ pub fn cleanup_session<C: HerdrClient>(
     first.map_or(Ok(()), Err)
 }
 
-pub fn zoom_picker<C: HerdrClient>(
-    client: &mut C,
-    snapshot: &PickerSnapshot,
-    pane_id: &PaneId,
-) -> Result<()> {
-    if snapshot.session.zoom_picker {
-        client.zoom_pane(pane_id)?;
-    }
-
-    Ok(())
-}
-
 pub fn run_snapshot_picker(snapshot: &PickerSnapshot) -> Result<()> {
     match snapshot.action {
         PickerAction::Flash => crate::picker::run_flash_picker(snapshot).map(|_| ()),
@@ -212,8 +242,8 @@ mod tests {
     use crate::herdr::client::AppliedLayout;
     use crate::herdr::layout::{LayoutPane, LayoutSnapshot};
     use crate::model::{
-        PaneTextCaptureMode, Rect, SourcePaneSnapshot, SplitDirection, StylePalette,
-        VisibleViewport,
+        PaneTextCaptureMode, PickerPaneSnapshot, Rect, SourcePaneSnapshot, SplitDirection,
+        StylePalette, VisibleViewport,
     };
     use anyhow::anyhow;
 
@@ -221,7 +251,8 @@ mod tests {
     struct FakeClient {
         layout: Option<LayoutSnapshot>,
         calls: Vec<String>,
-        launch_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+        launch_paths: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>,
+        launch_root: Option<LaunchLayoutNode>,
         fail_focus_pane: bool,
         fail_focus_tab: bool,
     }
@@ -237,14 +268,20 @@ mod tests {
             Ok("https://example.com".into())
         }
 
-        fn apply_layout(
+        fn apply_hidden_layout(
             &mut self,
             workspace_id: &str,
             _tab_label: &str,
             root: &LaunchLayoutNode,
         ) -> Result<AppliedLayout> {
-            self.calls.push(format!("apply:{workspace_id}"));
+            self.calls.push(format!("apply_hidden:{workspace_id}"));
             self.launch_paths = picker_paths(root);
+            self.launch_root = Some(root.clone());
+            let (_, _, painted) = self
+                .launch_paths
+                .as_ref()
+                .context("missing picker launch paths")?;
+            std::fs::write(painted, b"painted")?;
             Ok(AppliedLayout {
                 tab_id: "w1:t2".into(),
                 picker_pane_id: PaneId::new("w1:p2"),
@@ -253,18 +290,14 @@ mod tests {
 
         fn focus_pane(&mut self, pane: &PaneId) -> Result<()> {
             self.calls.push(format!("focus_pane:{pane}"));
-            let (_, ready) = self.launch_paths.as_ref().context("missing launch paths")?;
+            let (_, ready, painted) = self.launch_paths.as_ref().context("missing launch paths")?;
             assert!(!ready.exists(), "barrier released before picker focus");
+            assert!(painted.exists(), "picker focused before its first frame");
             if self.fail_focus_pane {
                 Err(anyhow!("focus failed"))
             } else {
                 Ok(())
             }
-        }
-
-        fn zoom_pane(&mut self, pane: &PaneId) -> Result<()> {
-            self.calls.push(format!("zoom:{pane}"));
-            Ok(())
         }
 
         fn focus_tab(&mut self, tab_id: &str) -> Result<()> {
@@ -282,12 +315,18 @@ mod tests {
         }
     }
 
-    fn picker_paths(node: &LaunchLayoutNode) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    fn picker_paths(
+        node: &LaunchLayoutNode,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
         match node {
             LaunchLayoutNode::Pane { command }
                 if command.get(1).is_some_and(|argument| argument == "pick") =>
             {
-                Some((command.get(3)?.into(), command.get(5)?.into()))
+                Some((
+                    command.get(3)?.into(),
+                    command.get(5)?.into(),
+                    command.get(7)?.into(),
+                ))
             }
             LaunchLayoutNode::Split { first, second, .. } => {
                 picker_paths(first).or_else(|| picker_paths(second))
@@ -312,7 +351,7 @@ mod tests {
         }
     }
 
-    fn picker_snapshot(zoom_picker: bool) -> PickerSnapshot {
+    fn picker_snapshot() -> PickerSnapshot {
         PickerSnapshot {
             source: SourcePaneSnapshot {
                 target_pane_id: PaneId::new("w1:p1"),
@@ -329,10 +368,13 @@ mod tests {
                 }),
                 capture_mode: PaneTextCaptureMode::ExactVisibleUnwrapped,
             },
+            picker: PickerPaneSnapshot {
+                content_width: 80,
+                content_height: 24,
+            },
             session: PickerReturnContext {
                 return_tab_id: "w1:t1".into(),
                 return_pane_id: PaneId::new("w1:p1"),
-                zoom_picker,
             },
             action: PickerAction::Copy,
             custom_patterns: Vec::new(),
@@ -362,6 +404,7 @@ mod tests {
             Path::new("/a b/π'"),
             Path::new("/s p"),
             Path::new("/r p"),
+            Path::new("/p p"),
         );
         let LaunchLayoutNode::Split {
             direction,
@@ -388,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_focuses_picker_before_releasing_barrier() {
+    fn launch_waits_for_painted_frame_before_focus_and_ready_barrier() {
         let mut client = FakeClient {
             layout: Some(source_layout(false)),
             ..FakeClient::default()
@@ -410,18 +453,56 @@ mod tests {
             [
                 "pane_layout",
                 "pane_read:24",
-                "apply:w1",
+                "apply_hidden:w1",
                 "focus_pane:w1:p2"
             ]
         );
-        let (snapshot, ready) = client.launch_paths.unwrap();
+        let (snapshot, ready, painted) = client.launch_paths.unwrap();
         assert!(ready.exists());
-        let files = PickerLaunchFiles {
-            snapshot_path: snapshot,
-            marker_temp_path: ready.with_extension("ready.tmp"),
-            ready_path: ready,
-        };
+        assert!(painted.exists());
+        let files = PickerLaunchFiles::from_paths(snapshot, ready, painted);
         files.cleanup().unwrap();
+    }
+
+    #[test]
+    fn zoomed_source_uses_one_hidden_picker_pane() {
+        let mut layout = source_layout(true);
+        layout.panes[0].rect = Rect::new(0, 0, 40, 24);
+        layout.panes.push(LayoutPane {
+            focused: false,
+            pane_id: "w1:p9".into(),
+            rect: Rect::new(40, 0, 40, 24),
+        });
+        let mut client = FakeClient {
+            layout: Some(layout),
+            ..FakeClient::default()
+        };
+
+        launch_layout_tab_picker(
+            &mut client,
+            &PaneId::new("w1:p1"),
+            Path::new("/tmp/herdr flash"),
+            PickerAction::Flash,
+            Vec::new(),
+            true,
+            StylePalette::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            client.launch_root,
+            Some(LaunchLayoutNode::Pane { ref command })
+                if command.get(1).is_some_and(|argument| argument == "pick")
+        ));
+        let (snapshot, ready, painted) = client.launch_paths.unwrap();
+        let payload = crate::herdr::snapshot::read_snapshot_file(&snapshot).unwrap();
+        assert_eq!(payload.source.target_content_width, 77);
+        assert_eq!(payload.source.target_content_height, 22);
+        assert_eq!(payload.picker.content_width, 79);
+        assert_eq!(payload.picker.content_height, 24);
+        PickerLaunchFiles::from_paths(snapshot, ready, painted)
+            .cleanup()
+            .unwrap();
     }
 
     #[test]
@@ -447,13 +528,13 @@ mod tests {
         assert_eq!(error.to_string(), "focus failed");
         assert!(client.calls.contains(&"focus_tab:w1:t1".into()));
         assert!(client.calls.contains(&"close_tab:w1:t2".into()));
-        let (snapshot, ready) = client.launch_paths.unwrap();
-        assert!(!snapshot.exists() && !ready.exists());
+        let (snapshot, ready, painted) = client.launch_paths.unwrap();
+        assert!(!snapshot.exists() && !ready.exists() && !painted.exists());
     }
 
     #[test]
     fn cleanup_attempts_close_after_focus_failure_and_rejects_source_tab() {
-        let session = picker_snapshot(false).session;
+        let session = picker_snapshot().session;
         let mut client = FakeClient {
             fail_focus_tab: true,
             ..FakeClient::default()
@@ -467,13 +548,5 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("refusing"));
-    }
-
-    #[test]
-    fn zooms_only_when_snapshot_requests_it() {
-        let mut client = FakeClient::default();
-        zoom_picker(&mut client, &picker_snapshot(false), &PaneId::new("w1:p2")).unwrap();
-        zoom_picker(&mut client, &picker_snapshot(true), &PaneId::new("w1:p2")).unwrap();
-        assert_eq!(client.calls, ["zoom:w1:p2"]);
     }
 }

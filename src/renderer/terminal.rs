@@ -204,11 +204,13 @@ mod tests {
     #[test]
     fn a_custom_palette_drives_the_emitted_colors() {
         force_colors();
-        let mut palette = StylePalette::default();
-        palette.label = crate::model::StyleSpec {
-            fg: None,
-            bg: Some([1, 2, 3]),
-            bold: false,
+        let palette = StylePalette {
+            label: crate::model::StyleSpec {
+                fg: None,
+                bg: Some([1, 2, 3]),
+                bold: false,
+            },
+            ..StylePalette::default()
         };
         let lines = vec![RenderLine {
             spans: vec![RenderSpan {
