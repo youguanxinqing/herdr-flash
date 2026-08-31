@@ -7,6 +7,7 @@
 //! Positions are `(row, display column)` against the visible grid, matching how the renderer lays
 //! cells out. Working in columns rather than byte offsets is what keeps wide CJK cells aligned.
 
+use crate::hints::HINT_ALPHABET;
 use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -59,6 +60,126 @@ impl Grid {
     fn chars(&self, row: usize) -> &[GridChar] {
         self.rows.get(row).map_or(&[], Vec::as_slice)
     }
+
+    /// The cell just before `pos` on its row; a row-leading `pos` stays put, since there is no
+    /// earlier cell for a `t` landing to occupy.
+    fn cell_before(&self, pos: Pos) -> Pos {
+        Pos {
+            col: prev_col(self.chars(pos.row), pos.col).unwrap_or(pos.col),
+            ..pos
+        }
+    }
+
+    /// The cell just after `pos` on its row; a row-ending `pos` stays put, mirroring
+    /// [`Grid::cell_before`] for backward `T` landings.
+    fn cell_after(&self, pos: Pos) -> Pos {
+        Pos {
+            col: next_col(self.chars(pos.row), pos.col).unwrap_or(pos.col),
+            ..pos
+        }
+    }
+}
+
+/// One visible occurrence of a char-jump (`t`/`f`/`T`/`F`) target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CharJumpTarget {
+    /// The cell holding the target character; this is the cell that gets highlighted.
+    pub hit: Pos,
+    /// Where the cursor lands: the hit itself for `f`/`F`, the cell on the cursor's side of it
+    /// for `t`/`T`.
+    pub landing: Pos,
+    /// The key that picks this target, or `None` past the alphabet — highlighted but unreachable.
+    pub label: Option<char>,
+}
+
+/// Every occurrence of `target` strictly on the cursor's search side of `from`, nearest first —
+/// reading order ahead of the cursor, reverse reading order behind it — so the first labels sit
+/// on the closest hits.
+///
+/// vim's `t`/`f` stop at the current row; a label overlay is only worth its keystroke when it can
+/// reach the rest of the pane, so candidates continue over the remaining rows. Matching is
+/// case-exact like vim. The target character is withheld from the label alphabet: this mode
+/// takes exactly one search character, and a label equal to it would read as typing a second one.
+pub fn char_jump_targets(
+    grid: &Grid,
+    from: Pos,
+    target: char,
+    till: bool,
+    backward: bool,
+) -> Vec<CharJumpTarget> {
+    let hits: Vec<Pos> = if backward {
+        (0..=from.row)
+            .rev()
+            .flat_map(|row| {
+                grid.chars(row)
+                    .iter()
+                    .rev()
+                    .filter(move |grid_char| {
+                        grid_char.ch == target && !(row == from.row && grid_char.col >= from.col)
+                    })
+                    .map(move |grid_char| Pos {
+                        row,
+                        col: grid_char.col,
+                    })
+            })
+            .collect()
+    } else {
+        (from.row..grid.row_count())
+            .flat_map(|row| {
+                grid.chars(row)
+                    .iter()
+                    .filter(move |grid_char| {
+                        grid_char.ch == target && !(row == from.row && grid_char.col <= from.col)
+                    })
+                    .map(move |grid_char| Pos {
+                        row,
+                        col: grid_char.col,
+                    })
+            })
+            .collect()
+    };
+
+    let mut targets: Vec<CharJumpTarget> = hits
+        .into_iter()
+        .map(|hit| CharJumpTarget {
+            hit,
+            landing: match (till, backward) {
+                (true, false) => grid.cell_before(hit),
+                (true, true) => grid.cell_after(hit),
+                (false, _) => hit,
+            },
+            label: None,
+        })
+        .collect();
+    label_page(&mut targets, target, 0);
+    targets
+}
+
+/// Moves the labels one alphabet-page further into the targets, wrapping past the last page.
+///
+/// A single character can hit more spots than the alphabet has keys. Two-key labels would break
+/// this mode's one-keystroke contract, so instead the same alphabet pages through the targets;
+/// hits outside the current page keep their highlight and wait for their page to come around.
+pub fn advance_char_jump_page(targets: &mut [CharJumpTarget], target: char) {
+    let page_len = HINT_ALPHABET
+        .chars()
+        .filter(|ch| *ch != target)
+        .count()
+        .max(1);
+    let start = targets
+        .iter()
+        .position(|jump| jump.label.is_some())
+        .map_or(0, |first| first + page_len);
+    let start = if start >= targets.len() { 0 } else { start };
+    label_page(targets, target, start);
+}
+
+/// Assigns the label alphabet to the targets from `start` on, clearing every earlier label.
+fn label_page(targets: &mut [CharJumpTarget], target: char, start: usize) {
+    let mut labels = HINT_ALPHABET.chars().filter(|ch| *ch != target);
+    for (index, jump) in targets.iter_mut().enumerate() {
+        jump.label = if index >= start { labels.next() } else { None };
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,10 +194,6 @@ pub enum Motion {
     LineStart,
     LineEnd,
     SwapEnds,
-    /// vim `f{char}`: the next occurrence of the char on this row.
-    FindChar(char),
-    /// vim `t{char}`: the cell just before the next occurrence.
-    TillChar(char),
 }
 
 /// A movable cursor that may or may not be dragging a selection behind it.
@@ -220,30 +337,8 @@ fn moved(pos: Pos, motion: Motion, grid: &Grid) -> Pos {
             col: word_end(chars, pos.col),
             ..pos
         },
-        Motion::FindChar(target) => Pos {
-            col: char_forward(chars, pos.col, target, false).unwrap_or(pos.col),
-            ..pos
-        },
-        Motion::TillChar(target) => Pos {
-            col: char_forward(chars, pos.col, target, true).unwrap_or(pos.col),
-            ..pos
-        },
         Motion::SwapEnds => pos,
     }
-}
-
-/// Column of the next `target` after the cursor (`f`), or of the cell just before it (`t`).
-/// `None` when the char does not occur again on this row — the cursor stays put, like vim.
-fn char_forward(chars: &[GridChar], col: usize, target: char, till: bool) -> Option<usize> {
-    let from = index_of(chars, col);
-    let hit = chars
-        .iter()
-        .enumerate()
-        .skip(from + 1)
-        .find(|(_, grid_char)| grid_char.ch == target)?
-        .0;
-    let landing = if till { hit - 1 } else { hit };
-    Some(chars[landing].col)
 }
 
 /// Vim-style word classes: whitespace, alphanumeric words, CJK runs, punctuation.
@@ -565,28 +660,109 @@ mod tests {
     }
 
     #[test]
-    fn till_and_find_stop_at_the_next_occurrence_on_the_row() {
-        let grid = grid(&["run cargo test"]);
-        let mut selection = Selection::new(at(0, 0));
+    fn char_jump_targets_run_forward_across_rows_and_stay_case_exact() {
+        let grid = grid(&["go now", "big gap"]);
+        let targets = char_jump_targets(&grid, at(0, 0), 'g', false, false);
 
-        selection.apply(Motion::FindChar('g'), &grid);
-        assert_eq!(selection.cursor.col, 7);
-        selection.apply(Motion::TillChar('t'), &grid);
-        assert_eq!(
-            selection.cursor.col, 9,
-            "lands just before the 't' of \"test\""
-        );
-        selection.apply(Motion::FindChar('z'), &grid);
-        assert_eq!(selection.cursor.col, 9, "an absent char moves nothing");
+        // The 'g' under the cursor is skipped; later rows contribute in reading order.
+        let hits: Vec<Pos> = targets.iter().map(|target| target.hit).collect();
+        assert_eq!(hits, vec![at(1, 2), at(1, 4)]);
+        // `f` lands on the hit itself.
+        assert_eq!(targets[0].landing, at(1, 2));
+        assert!(char_jump_targets(&grid, at(0, 0), 'G', false, false).is_empty());
+    }
+
+    #[test]
+    fn on_the_cursor_row_only_hits_after_the_cursor_count() {
+        let grid = grid(&["axa axa"]);
+        let targets = char_jump_targets(&grid, at(0, 2), 'a', false, false);
+
+        let hits: Vec<Pos> = targets.iter().map(|target| target.hit).collect();
+        assert_eq!(hits, vec![at(0, 4), at(0, 6)]);
     }
 
     #[test]
     fn till_lands_on_the_wide_char_before_the_target() {
         let grid = grid(&["黄色x"]);
-        let mut selection = Selection::new(at(0, 0));
+        let targets = char_jump_targets(&grid, at(0, 0), 'x', true, false);
 
-        selection.apply(Motion::TillChar('x'), &grid);
-        assert_eq!(selection.cursor.col, 2, "色 starts at column 2");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].landing, at(0, 2), "色 starts at column 2");
+    }
+
+    #[test]
+    fn till_at_a_row_start_stays_on_the_hit() {
+        let grid = grid(&["abc", "xyz"]);
+        let targets = char_jump_targets(&grid, at(0, 0), 'x', true, false);
+
+        // There is no cell before a row-leading hit, so the landing clamps onto it.
+        assert_eq!(targets[0].landing, at(1, 0));
+    }
+
+    #[test]
+    fn labels_skip_the_target_char_and_run_out_gracefully() {
+        let row = "z".repeat(30);
+        let grid = grid(&[row.as_str()]);
+        let targets = char_jump_targets(&grid, at(0, 0), 'z', false, false);
+
+        assert_eq!(targets.len(), 29);
+        assert!(
+            targets.iter().all(|target| target.label != Some('z')),
+            "the target char must never double as a label"
+        );
+        assert_eq!(targets[0].label, Some('a'));
+        assert!(
+            targets.last().unwrap().label.is_none(),
+            "past the alphabet, targets keep only the highlight"
+        );
+    }
+
+    #[test]
+    fn advancing_the_page_relabels_the_overflow_and_wraps_around() {
+        // 29 hits against a 25-key page ('z' is withheld): the tail four are unreachable until
+        // the page advances onto them, and a further advance wraps back to the nearest hits.
+        let row = "z".repeat(30);
+        let grid = grid(&[row.as_str()]);
+        let mut targets = char_jump_targets(&grid, at(0, 0), 'z', false, false);
+
+        advance_char_jump_page(&mut targets, 'z');
+        assert!(targets[..25].iter().all(|jump| jump.label.is_none()));
+        assert_eq!(targets[25].label, Some('a'));
+        assert_eq!(targets[28].label, Some('f'));
+
+        advance_char_jump_page(&mut targets, 'z');
+        assert_eq!(targets[0].label, Some('a'));
+        assert!(targets[25..].iter().all(|jump| jump.label.is_none()));
+    }
+
+    #[test]
+    fn backward_targets_run_nearest_first_and_stop_before_the_cursor() {
+        let grid = grid(&["big gap", "go now"]);
+        let targets = char_jump_targets(&grid, at(1, 0), 'g', false, true);
+
+        // The 'g' under the cursor is skipped; earlier hits arrive closest-first so the first
+        // labels sit next to the cursor.
+        let hits: Vec<Pos> = targets.iter().map(|target| target.hit).collect();
+        assert_eq!(hits, vec![at(0, 4), at(0, 2)]);
+        assert_eq!(targets[0].label, Some('a'));
+    }
+
+    #[test]
+    fn backward_till_lands_just_after_the_hit() {
+        let grid = grid(&["x黄色"]);
+        let targets = char_jump_targets(&grid, at(0, 3), 'x', true, true);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].landing, at(0, 1), "黄 starts at column 1");
+    }
+
+    #[test]
+    fn backward_till_at_a_row_end_stays_on_the_hit() {
+        let grid = grid(&["abx", "cde"]);
+        let targets = char_jump_targets(&grid, at(1, 1), 'x', true, true);
+
+        // There is no cell after a row-ending hit, so the landing clamps onto it.
+        assert_eq!(targets[0].landing, at(0, 2));
     }
 
     #[test]

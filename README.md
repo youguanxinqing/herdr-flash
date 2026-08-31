@@ -22,7 +22,9 @@ Escape or Ctrl-C exits from any phase.
 | cursor / select | `h j k l` | move by cell |
 | cursor / select | `w b e` | word forward / back / end |
 | cursor / select | `0 $` | line start / end |
-| cursor / select | `t{char} f{char}` | till / find a character on the line |
+| cursor / select | `t{char} f{char}` | till / find a character, searching forward across lines; a unique hit jumps at once, several hits get one-key labels and the label picks one (any other key cancels) |
+| cursor / select | `T{char} F{char}` | the same, searching backward from the cursor |
+| char jump | Space | when hits outnumber the label alphabet, page the labels onto the uncovered (highlight-only) hits, wrapping around |
 | cursor / select | `v` / `V` | start (or drop) a charwise / linewise selection |
 | select | `o` | swap the cursor and the anchor |
 | select | `y` or Enter | yank the selection (inert while no selection is active) |

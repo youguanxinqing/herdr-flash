@@ -8,7 +8,9 @@ use crate::picker::input::{
     CrosstermInputSource, CursorGuard, InputSource, PickerInputEvent, RawModeGuard,
 };
 use crate::renderer::{render_flash_labels, render_selection, terminal, token_cell_bounds};
-use crate::select::{Grid, Motion, Pos, Selection};
+use crate::select::{
+    advance_char_jump_page, char_jump_targets, CharJumpTarget, Grid, Motion, Pos, Selection,
+};
 use crate::viewport::map_visible_viewport;
 use anyhow::Result;
 use std::io::{self, Write};
@@ -45,7 +47,7 @@ where
     let grid = Grid::new(&viewport.rows);
     let mut query = String::new();
     let mut selection: Option<Selection> = None;
-    let mut pending_char: Option<CharMotion> = None;
+    let mut pending_char: Option<CharJump> = None;
     let mut notice: Option<String> = None;
 
     // No entry clear: every frame is fitted to the live terminal size and paints every cell, so
@@ -62,12 +64,19 @@ where
         // would leave stale cells at the right edge.
         let (cols, rows) = live_grid(width, height);
         let content = match &selection {
-            Some(active) => render_selection(&viewport, active, width, height),
+            Some(active) => {
+                // While a t/f waits on its pick, the pending targets render like flash labels.
+                let jumps = match &pending_char {
+                    Some(CharJump::AwaitLabel { targets, .. }) => targets.as_slice(),
+                    _ => &[],
+                };
+                render_selection(&viewport, active, jumps, width, height)
+            }
             None => render_flash_labels(&viewport, &labels, width, height),
         };
         let source_cols = width as usize;
         let status = match &selection {
-            Some(active) => legend_line(active, &query, source_cols),
+            Some(active) => legend_line(active, pending_char.as_ref(), &query, source_cols),
             None => prompt_line(&labels, &query, notice.as_deref(), source_cols),
         };
         let lines = compose_frame(content, status, source_cols, cols, rows);
@@ -175,11 +184,45 @@ enum SelectStep {
     Yank,
 }
 
-/// A `t`/`f` waiting for its target character.
+/// A `t`/`f`/`T`/`F` waiting for its target character.
 #[derive(Clone, Copy)]
 enum CharMotion {
     Till,
     Find,
+    TillBack,
+    FindBack,
+}
+
+impl CharMotion {
+    fn key(self) -> char {
+        match self {
+            CharMotion::Till => 't',
+            CharMotion::Find => 'f',
+            CharMotion::TillBack => 'T',
+            CharMotion::FindBack => 'F',
+        }
+    }
+
+    fn till(self) -> bool {
+        matches!(self, CharMotion::Till | CharMotion::TillBack)
+    }
+
+    fn backward(self) -> bool {
+        matches!(self, CharMotion::TillBack | CharMotion::FindBack)
+    }
+}
+
+/// A char motion in flight.
+///
+/// The motion takes exactly one target character. When several occurrences are visible it does
+/// not jump blind: every occurrence gets a one-key label, and the next keystroke picks one.
+enum CharJump {
+    AwaitTarget(CharMotion),
+    AwaitLabel {
+        kind: CharMotion,
+        target: char,
+        targets: Vec<CharJumpTarget>,
+    },
 }
 
 /// Lands a bare cursor on the first cell of a match, selecting nothing.
@@ -197,20 +240,59 @@ fn cursor_at(viewport: &VisibleViewport, hit: &FlashCandidate) -> Option<Selecti
 fn select_step(
     selection: &mut Selection,
     grid: &Grid,
-    pending: &mut Option<CharMotion>,
+    pending: &mut Option<CharJump>,
     event: PickerInputEvent,
 ) -> SelectStep {
-    // A pending t/f consumes the next character as its target, vim-style. Anything that is not a
-    // character abandons the pending motion and is handled normally below.
-    if let Some(kind) = pending.take() {
-        if let PickerInputEvent::Char(target) = event {
-            let motion = match kind {
-                CharMotion::Till => Motion::TillChar(target),
-                CharMotion::Find => Motion::FindChar(target),
-            };
-            selection.apply(motion, grid);
-            return SelectStep::Continue;
+    // A pending char motion consumes character keystrokes: first the target, then — when several
+    // occurrences are visible — the label that picks one. Anything that is not a character
+    // abandons the pending motion and is handled normally below.
+    match pending.take() {
+        Some(CharJump::AwaitTarget(kind)) => {
+            if let PickerInputEvent::Char(target) = event {
+                let targets =
+                    char_jump_targets(grid, selection.cursor, target, kind.till(), kind.backward());
+                match targets.len() {
+                    // An absent char moves nothing, like vim.
+                    0 => {}
+                    // A unique target needs no label round-trip.
+                    1 => selection.cursor = targets[0].landing,
+                    _ => {
+                        *pending = Some(CharJump::AwaitLabel {
+                            kind,
+                            target,
+                            targets,
+                        })
+                    }
+                }
+                return SelectStep::Continue;
+            }
         }
+        Some(CharJump::AwaitLabel {
+            kind,
+            target,
+            mut targets,
+        }) => {
+            if let PickerInputEvent::Char(pick) = event {
+                // Space pages the alphabet onto the targets it could not cover. It can never be
+                // a label itself, so the key is free in this state.
+                if pick == ' ' {
+                    advance_char_jump_page(&mut targets, target);
+                    *pending = Some(CharJump::AwaitLabel {
+                        kind,
+                        target,
+                        targets,
+                    });
+                    return SelectStep::Continue;
+                }
+                if let Some(hit) = targets.iter().find(|jump| jump.label == Some(pick)) {
+                    selection.cursor = hit.landing;
+                }
+                // Any other character only cancels the jump: a stray key pressed mid-jump must
+                // not yank, reselect, or move the cursor.
+                return SelectStep::Continue;
+            }
+        }
+        None => {}
     }
 
     let motion = match event {
@@ -232,11 +314,19 @@ fn select_step(
             return SelectStep::Continue;
         }
         PickerInputEvent::Char('t') => {
-            *pending = Some(CharMotion::Till);
+            *pending = Some(CharJump::AwaitTarget(CharMotion::Till));
             return SelectStep::Continue;
         }
         PickerInputEvent::Char('f') => {
-            *pending = Some(CharMotion::Find);
+            *pending = Some(CharJump::AwaitTarget(CharMotion::Find));
+            return SelectStep::Continue;
+        }
+        PickerInputEvent::Char('T') => {
+            *pending = Some(CharJump::AwaitTarget(CharMotion::TillBack));
+            return SelectStep::Continue;
+        }
+        PickerInputEvent::Char('F') => {
+            *pending = Some(CharJump::AwaitTarget(CharMotion::FindBack));
             return SelectStep::Continue;
         }
         PickerInputEvent::Char('h') => Motion::Left,
@@ -335,12 +425,44 @@ fn blank_row(width: usize) -> RenderLine {
     }
 }
 
-fn legend_line(selection: &Selection, query: &str, width: usize) -> RenderLine {
-    let keys = if selection.active() {
-        let mode = if selection.linewise { "line" } else { "char" };
-        format!("  select {mode} · hjkl/wbe/0$ · o/t/f · y yank · bksp search · esc exit")
-    } else {
-        "  cursor · hjkl/wbe/0$ · v/V select · t/f · bksp search · esc exit".to_string()
+fn legend_line(
+    selection: &Selection,
+    pending: Option<&CharJump>,
+    query: &str,
+    width: usize,
+) -> RenderLine {
+    // The char-jump states are modal but otherwise invisible; the legend is what says the next
+    // keystroke is about to be eaten.
+    let keys = match pending {
+        Some(CharJump::AwaitTarget(kind)) => {
+            format!("  {} · type target char", kind.key())
+        }
+        Some(CharJump::AwaitLabel {
+            kind,
+            target,
+            targets,
+        }) => {
+            // Unlabeled targets exist exactly when the alphabet cannot cover every hit, which
+            // is when paging has something to reach.
+            let paging = if targets.iter().any(|jump| jump.label.is_none()) {
+                " · space pages"
+            } else {
+                ""
+            };
+            format!(
+                "  {}{} · {} targets · label jumps{paging} · other key cancels",
+                kind.key(),
+                target,
+                targets.len()
+            )
+        }
+        None if selection.active() => {
+            let mode = if selection.linewise { "line" } else { "char" };
+            format!("  select {mode} · hjkl/wbe/0$ · o · t/f/T/F · y yank · bksp search · esc exit")
+        }
+        None => {
+            "  cursor · hjkl/wbe/0$ · v/V select · t/f/T/F · bksp search · esc exit".to_string()
+        }
     };
     status_row(query, &keys, width)
 }
@@ -552,6 +674,186 @@ mod tests {
                 text: "https://example.com/path".to_string()
             }
         );
+    }
+
+    #[test]
+    fn a_char_jump_with_many_targets_labels_them_and_a_label_picks_one() {
+        // Cursor lands on the 'r' of "run". `f o` sees two 'o's — "cargo" and "now" — so instead
+        // of a blind jump the picker labels both ('a', then 's') and waits one keystroke.
+        let clipboard = FakeClipboard::default();
+        let mut input = FakeInput::new(vec![
+            PickerInputEvent::Char('r'),
+            PickerInputEvent::Enter,
+            PickerInputEvent::Char('f'),
+            PickerInputEvent::Char('o'),
+            PickerInputEvent::Char('s'),
+            PickerInputEvent::Char('v'),
+            PickerInputEvent::Char('$'),
+            PickerInputEvent::Char('y'),
+        ]);
+        let mut output = Vec::new();
+
+        let outcome = run_flash_with(
+            &snapshot(vec!["run cargo now"], 80, 4),
+            &mut input,
+            &clipboard,
+            &mut output,
+        )
+        .unwrap();
+
+        // 's' picked the second 'o' (in "now"); the first would have yanked "o now".
+        assert_eq!(
+            outcome,
+            PickerOutcome::Copied {
+                text: "ow".to_string()
+            }
+        );
+        let rendered = String::from_utf8(output).unwrap();
+        // Both modal states announce themselves on the status row.
+        assert!(rendered.contains("f · type target char"));
+        assert!(rendered.contains("fo · 2 targets"));
+    }
+
+    #[test]
+    fn char_jump_targets_reach_later_rows() {
+        // `f x` from "alpha" has hits on two later rows; the second label lands the cursor on
+        // row 2, proven by the linewise yank grabbing that row.
+        let (outcome, _) = run(
+            vec![
+                PickerInputEvent::Char('p'),
+                PickerInputEvent::Char('h'),
+                PickerInputEvent::Enter,
+                PickerInputEvent::Char('f'),
+                PickerInputEvent::Char('x'),
+                PickerInputEvent::Char('s'),
+                PickerInputEvent::Char('V'),
+                PickerInputEvent::Char('y'),
+            ],
+            vec!["alpha", "beta x", "gamma x"],
+        );
+
+        assert_eq!(
+            outcome,
+            PickerOutcome::Copied {
+                text: "gamma x".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn space_pages_labels_onto_targets_past_the_alphabet() {
+        // 27 'x's overflow the 25-key page ('x' is withheld from its own labels). One space
+        // moves the labels onto the two overflow hits, and 's' picks the very last one.
+        let row = format!("m{}end", "x".repeat(27));
+        let clipboard = FakeClipboard::default();
+        let mut input = FakeInput::new(vec![
+            PickerInputEvent::Char('m'),
+            PickerInputEvent::Enter,
+            PickerInputEvent::Char('f'),
+            PickerInputEvent::Char('x'),
+            PickerInputEvent::Char(' '),
+            PickerInputEvent::Char('s'),
+            PickerInputEvent::Char('v'),
+            PickerInputEvent::Char('e'),
+            PickerInputEvent::Char('y'),
+        ]);
+        let mut output = Vec::new();
+
+        let outcome = run_flash_with(
+            &snapshot(vec![row.as_str()], 80, 4),
+            &mut input,
+            &clipboard,
+            &mut output,
+        )
+        .unwrap();
+
+        // 's' is the second label of the new page: the 27th 'x', right before "end".
+        assert_eq!(
+            outcome,
+            PickerOutcome::Copied {
+                text: "xend".to_string()
+            }
+        );
+        assert!(String::from_utf8(output).unwrap().contains("space pages"));
+    }
+
+    #[test]
+    fn a_backward_jump_searches_left_of_the_cursor_and_labels_nearest_first() {
+        // Cursor sits on the "ow" of "now"; `F o` looks backward only, so the two hits are the
+        // 'o' of "two" (nearest, label 'a') and the 'o' of "one" (label 's').
+        let clipboard = FakeClipboard::default();
+        let mut input = FakeInput::new(vec![
+            PickerInputEvent::Char('o'),
+            PickerInputEvent::Char('w'),
+            PickerInputEvent::Enter,
+            PickerInputEvent::Char('F'),
+            PickerInputEvent::Char('o'),
+            PickerInputEvent::Char('s'),
+            PickerInputEvent::Char('v'),
+            PickerInputEvent::Char('e'),
+            PickerInputEvent::Char('y'),
+        ]);
+        let mut output = Vec::new();
+
+        let outcome = run_flash_with(
+            &snapshot(vec!["one two now"], 80, 4),
+            &mut input,
+            &clipboard,
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            PickerOutcome::Copied {
+                text: "one".to_string()
+            }
+        );
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("Fo · 2 targets"));
+    }
+
+    #[test]
+    fn a_key_that_is_no_label_cancels_the_jump_and_nothing_else() {
+        // 'q' is not one of the offered labels, so it must only drop the jump: the cursor stays
+        // on 'r' and the next keys select there as if no t/f had been pressed.
+        let (outcome, _) = run(
+            vec![
+                PickerInputEvent::Char('r'),
+                PickerInputEvent::Enter,
+                PickerInputEvent::Char('f'),
+                PickerInputEvent::Char('o'),
+                PickerInputEvent::Char('q'),
+                PickerInputEvent::Char('v'),
+                PickerInputEvent::Char('y'),
+            ],
+            vec!["run cargo now"],
+        );
+
+        assert_eq!(
+            outcome,
+            PickerOutcome::Copied {
+                text: "r".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn escape_exits_even_while_labels_are_waiting() {
+        let (outcome, copied) = run(
+            vec![
+                PickerInputEvent::Char('r'),
+                PickerInputEvent::Enter,
+                PickerInputEvent::Char('f'),
+                PickerInputEvent::Char('o'),
+                PickerInputEvent::Escape,
+            ],
+            vec!["run cargo now"],
+        );
+
+        assert_eq!(outcome, PickerOutcome::Cancelled);
+        assert!(copied.is_empty());
     }
 
     #[test]

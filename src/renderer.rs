@@ -5,7 +5,7 @@ use crate::hints::HintAssignments;
 use crate::model::{
     LogicalLineVisualSegment, MatchSpan, Rect, RenderLine, RenderSpan, RenderStyle, VisibleViewport,
 };
-use crate::select::Selection;
+use crate::select::{CharJumpTarget, Selection};
 use std::collections::HashSet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -219,10 +219,12 @@ fn apply_visible_occurrence(
     }
 }
 
-/// Renders exact visible rows with a selection highlighted and its cursor end marked.
+/// Renders exact visible rows with a selection highlighted, its cursor end marked, and any
+/// pending char-jump targets overlaid.
 pub fn render_selection(
     viewport: &VisibleViewport,
     selection: &Selection,
+    jumps: &[CharJumpTarget],
     width: u16,
     height: u16,
 ) -> Vec<RenderLine> {
@@ -262,6 +264,31 @@ pub fn render_selection(
         .and_then(|row| row.get_mut(selection.cursor.col))
     {
         cell.style = RenderStyle::Cursor;
+    }
+
+    // Jump targets paint last so a label stays readable inside a selection highlight. A labeled
+    // hit shows the label in place of its character, flash.nvim style; past the alphabet the
+    // character keeps its own glyph with the match highlight. A one-column label over a wide
+    // character would shrink the row, so the freed continuation cell becomes a space.
+    for jump in jumps {
+        let Some(cell) = cells
+            .get_mut(jump.hit.row)
+            .and_then(|row| row.get_mut(jump.hit.col))
+        else {
+            continue;
+        };
+        let Some(label) = jump.label else {
+            cell.style = RenderStyle::Match;
+            continue;
+        };
+        let was_wide = UnicodeWidthStr::width(cell.text.as_str()) > 1;
+        cell.text = label.to_string();
+        cell.style = RenderStyle::Hint;
+        if was_wide {
+            if let Some(rest) = cells[jump.hit.row].get_mut(jump.hit.col + 1) {
+                rest.text = " ".to_string();
+            }
+        }
     }
 
     cells.into_iter().map(cells_to_render_line).collect()
@@ -650,7 +677,7 @@ mod tests {
         let mut selection = crate::select::Selection::new(crate::select::Pos { row: 0, col: 0 });
         selection.begin(true);
 
-        let lines = render_selection(&viewport, &selection, 20, 1);
+        let lines = render_selection(&viewport, &selection, &[], 20, 1);
         let painted = styled_cols(&lines[0], RenderStyle::Selection);
 
         // Column 0 carries the cursor, so only 1 and 2 are left as selection body.
@@ -669,10 +696,45 @@ mod tests {
         selection.begin(true);
         selection.cursor = crate::select::Pos { row: 1, col: 0 };
 
-        let lines = render_selection(&viewport, &selection, 20, 2);
+        let lines = render_selection(&viewport, &selection, &[], 20, 2);
 
         // Row 1 is blank; its single cell is the cursor, which must still be visible.
         assert_eq!(styled_cols(&lines[1], RenderStyle::Cursor), vec![0]);
+    }
+
+    #[test]
+    fn jump_labels_replace_the_char_and_keep_the_row_width() {
+        use crate::select::{CharJumpTarget, Pos, Selection};
+
+        let viewport = crate::viewport::map_visible_viewport(vec!["黄色x".to_string()], 10, 1);
+        let selection = Selection::new(Pos { row: 0, col: 0 });
+        let jumps = [
+            // Labeled hit on the wide 色 (columns 2-3): the label takes column 2 and the freed
+            // continuation cell must become a space, or the row shrinks by one column.
+            CharJumpTarget {
+                hit: Pos { row: 0, col: 2 },
+                landing: Pos { row: 0, col: 0 },
+                label: Some('a'),
+            },
+            // Unlabeled hit on 'x': highlight only, glyph kept.
+            CharJumpTarget {
+                hit: Pos { row: 0, col: 4 },
+                landing: Pos { row: 0, col: 4 },
+                label: None,
+            },
+        ];
+
+        let lines = render_selection(&viewport, &selection, &jumps, 10, 1);
+
+        let text: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+        assert_eq!(crate::hints::display_width(&text), 10);
+        assert!(text.contains("a x"), "label, freed cell, kept glyph");
+        assert_eq!(styled_cols(&lines[0], RenderStyle::Hint), vec![2]);
+        assert_eq!(styled_cols(&lines[0], RenderStyle::Match), vec![4]);
     }
 
     use super::*;
