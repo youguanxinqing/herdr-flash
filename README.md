@@ -1,8 +1,27 @@
 # Herdr Flash
 
+**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
+
 Herdr Flash is a [Herdr](https://herdr.dev) plugin that brings the [flash.nvim](https://github.com/folke/flash.nvim) copy flow to terminal panes: search the visible text, jump to a match by label, select with vim motions, and yank to your system clipboard.
 
 Where hint pickers decide *for* you what a token is, Flash separates the two questions: the search answers **where to look**, and the motions answer **what to take**. Type a few characters, land the cursor on the hit, then pull exactly the text you want — a word, half a URL, three lines.
+
+<table>
+<tr>
+<td width="33%" align="center" valign="top">
+<a href="docs/images/01-search.png"><img src="docs/images/01-search.png" width="280" alt="Search phase: every match of the query mi is highlighted, with a one-key label past each hit"></a>
+<br><sub><b>1 · Search</b><br>Typing <code>mi</code> lights every hit in the pane and drops a one-key label just past each one; the status row keeps the count.</sub>
+</td>
+<td width="33%" align="center" valign="top">
+<a href="docs/images/02-char-jump.png"><img src="docs/images/02-char-jump.png" width="280" alt="Character jump: f v labels every v ahead of the cursor as a jump target"></a>
+<br><sub><b>2 · Jump by character</b><br>With the cursor placed, <code>f v</code> turns every <code>v</code> ahead of it into a labeled target — one key lands there, any other key cancels.</sub>
+</td>
+<td width="33%" align="center" valign="top">
+<a href="docs/images/03-select-yank.png"><img src="docs/images/03-select-yank.png" width="280" alt="Selection phase: a charwise selection spanning several lines, ready to yank"></a>
+<br><sub><b>3 · Select and yank</b><br><code>v</code> opens a charwise selection that vim motions extend across lines; <code>y</code> copies it to the system clipboard.</sub>
+</td>
+</tr>
+</table>
 
 ## The flow
 
@@ -22,14 +41,15 @@ Escape or Ctrl-C exits from any phase.
 | cursor / select | `h j k l` | move by cell |
 | cursor / select | `w b e` | word forward / back / end |
 | cursor / select | `0 $` | line start / end |
-| cursor / select | `t{char} f{char}` | till / find a character, searching forward across lines; a unique hit jumps at once, several hits get one-key labels and the label picks one (any other key cancels) |
-| cursor / select | `T{char} F{char}` | the same, searching backward from the cursor |
-| char jump | Space | when hits outnumber the label alphabet, page the labels onto the uncovered (highlight-only) hits, wrapping around |
+| cursor / select | `t{char}` `f{char}` | till / find a character, forward across lines |
+| cursor / select | `T{char}` `F{char}` | the same, searching backward from the cursor |
 | cursor / select | `v` / `V` | start (or drop) a charwise / linewise selection |
 | select | `o` | swap the cursor and the anchor |
 | select | `y` or Enter | yank the selection (inert while no selection is active) |
 | cursor / select | Backspace | back to search, query intact |
 | anywhere | Esc / Ctrl-C | exit without copying |
+
+A `t`/`f`/`T`/`F` with one hit jumps straight there. Several hits get one-key labels — the label picks one, any other key cancels — and when the hits outnumber the label alphabet, `Space` pages the labels onto the hits still uncovered, wrapping around.
 
 A keystroke that happens to be a live label jumps instead of extending the query; one Backspace returns to the search with the query still there.
 
@@ -98,6 +118,8 @@ Verify Herdr can see the action:
 ```bash
 herdr plugin action list --plugin youguanxinqing.herdr-flash
 ```
+
+To remove it again: `herdr plugin uninstall youguanxinqing.herdr-flash` (or `herdr plugin unlink youguanxinqing.herdr-flash` for a linked checkout).
 
 ## Keybinding
 
