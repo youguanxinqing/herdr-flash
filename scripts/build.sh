@@ -4,4 +4,8 @@
 set -eu
 cargo build --release
 mkdir -p bin
-cp target/release/herdr-flash bin/herdr-flash
+# Stage via rename onto a fresh inode: overwriting bin/herdr-flash in place poisons the vnode's
+# cached code signature on macOS, and execs from it are then killed with SIGKILL (Code Signature
+# Invalid) until the cache recovers. See docs/bugs/build-overwrite-codesign-kill.md.
+cp target/release/herdr-flash bin/herdr-flash.tmp
+mv -f bin/herdr-flash.tmp bin/herdr-flash
