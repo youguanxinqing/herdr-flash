@@ -2,6 +2,7 @@ pub mod client;
 pub mod context;
 pub mod executor;
 pub mod layout;
+mod lock;
 mod protocol;
 pub mod snapshot;
 mod socket;
@@ -116,9 +117,15 @@ impl HerdrAdapter {
             .tab_id
             .clone()
             .context("picker process is missing HERDR_TAB_ID")?;
+        // While this process lives, a repeat action keypress targeting this tab must be refused
+        // instead of stacking a second picker over this one's rendered frame.
+        let reentry_guard = lock::PickerTabLock::acquire(&temp_tab);
         let mut client = SocketHerdrClient::from_context(&self.context)?;
         let primary = wait_for_ready(ready_path, Duration::from_secs(10))
             .and_then(|_| run_snapshot_picker(&snapshot));
+        // Released before close_tab: Herdr may kill this process together with its tab, and the
+        // Drop fallback would never run.
+        drop(reentry_guard);
         let cleanup = cleanup_session(&mut client, &snapshot.session, &temp_tab);
         let files_cleanup = files.cleanup();
         match primary {

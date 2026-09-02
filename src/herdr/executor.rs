@@ -23,6 +23,18 @@ pub fn launch_layout_tab_picker<C: HerdrClient>(
     palette: StylePalette,
 ) -> Result<()> {
     let layout = client.pane_layout(target)?;
+
+    // prefix+s pressed inside flash mode targets a pane of the picker's own temporary tab. The
+    // picker the user is already looking at is the correct result, so the repeat is a no-op.
+    if let Some(tab_id) = layout.tab_id.as_deref() {
+        if crate::herdr::lock::tab_has_live_picker(tab_id) {
+            eprintln!(
+                "Herdr Flash: a picker is already open in tab {tab_id}; ignoring repeat invocation"
+            );
+            return Ok(());
+        }
+    }
+
     let geometry = derive_source_geometry(&layout, target);
     let source_was_zoomed = layout.zoomed && layout_target_is_focused(&layout, target);
     let plan = if source_was_zoomed {
@@ -462,6 +474,32 @@ mod tests {
         assert!(painted.exists());
         let files = PickerLaunchFiles::from_paths(snapshot, ready, painted);
         files.cleanup().unwrap();
+    }
+
+    #[test]
+    fn repeat_invocation_on_a_live_picker_tab_is_a_no_op() {
+        let tab = "executor-reentry:tab";
+        let mut layout = source_layout(false);
+        layout.tab_id = Some(tab.into());
+        let _lock = crate::herdr::lock::PickerTabLock::acquire(tab);
+        let mut client = FakeClient {
+            layout: Some(layout),
+            ..FakeClient::default()
+        };
+
+        launch_layout_tab_picker(
+            &mut client,
+            &PaneId::new("w1:p1"),
+            Path::new("/tmp/herdr-flash"),
+            PickerAction::Flash,
+            Vec::new(),
+            true,
+            StylePalette::default(),
+        )
+        .unwrap();
+
+        assert_eq!(client.calls, ["pane_layout"]);
+        assert!(client.launch_paths.is_none(), "no picker may be launched");
     }
 
     #[test]
