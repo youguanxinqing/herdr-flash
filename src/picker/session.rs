@@ -126,7 +126,7 @@ fn emit_selection_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clipboard::{ClipboardError, CopySuccess};
+    use crate::clipboard::ClipboardError;
     use crate::model::{
         PaneId, PaneTextCaptureMode, PickerPaneSnapshot, PickerReturnContext, SourcePaneSnapshot,
         StylePalette,
@@ -161,14 +161,11 @@ mod tests {
     }
 
     impl Clipboard for FakeClipboard {
-        fn copy(&self, text: &str) -> std::result::Result<CopySuccess, ClipboardError> {
+        fn copy(&self, text: &str) -> std::result::Result<(), ClipboardError> {
             self.copied.borrow_mut().push(text.to_string());
-            if let Some(error) = &self.error {
-                Err(error.clone())
-            } else {
-                Ok(CopySuccess {
-                    tool: "fake".to_string(),
-                })
+            match &self.error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
             }
         }
     }
@@ -388,8 +385,8 @@ mod tests {
     fn clipboard_failure_is_reported_and_not_treated_as_success() {
         let mut input = FakeInput::new(vec![PickerInputEvent::Char('a')]);
         let clipboard = FakeClipboard {
-            error: Some(ClipboardError::NoToolFound {
-                tried: "fake-copy".to_string(),
+            error: Some(ClipboardError::WriteFailed {
+                message: "broken pipe".to_string(),
             }),
             ..FakeClipboard::default()
         };

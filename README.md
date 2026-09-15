@@ -96,10 +96,9 @@ Omitted styles and omitted keys keep their defaults; an invalid value is ignored
 
 - Herdr 0.7.4 or newer
 - Rust/Cargo (installs currently build from source; no prebuilt release assets yet)
-- A system clipboard command:
-    - macOS: `pbcopy`
-    - Linux Wayland: `wl-copy`
-    - Linux X11: `xclip` or `xsel`
+- No clipboard tool: `y` copies over OSC 52, which Herdr relays to the terminal it is attached
+  to. That means a `herdr --remote` pane copies to the machine you are sitting at, not the remote
+  host.
 
 ## Install
 
@@ -132,6 +131,41 @@ type = "plugin_action"
 command = "youguanxinqing.herdr-flash.flash"
 description = "flash: search visible text, then select and yank"
 ```
+
+## If `y` stops copying
+
+`y` never runs `pbcopy`/`xclip`. It writes an OSC 52 sequence to its own pane, and Herdr relays
+that to the terminal it is attached to. OSC 52 is a terminal standard, not a documented Herdr
+plugin API, so it can stop working without Herdr considering it a breaking change. Two commands
+tell you which half of the chain broke before you open an issue anywhere.
+
+**1. Does the chain work at all?** Run this in a shell in any Herdr pane:
+
+```sh
+printf '\033]52;c;b3NjNTItd29ya3M=\a'
+```
+
+It has to be typed straight into that shell. A pipe, a `$(...)` capture, or an AI assistant running
+it for you all swallow the output before it reaches the terminal.
+
+Nothing is drawn; the sequence is invisible by design. Now paste somewhere.
+
+- **Pastes `osc52-works`** — the chain is fine and the bug is in this plugin.
+  [Open an issue here](https://github.com/youguanxinqing/herdr-flash/issues) with `herdr --version`
+  and which terminal you use.
+- **Pastes nothing, or the old contents** — something in the chain is not relaying OSC 52. No
+  change to this plugin can fix that; step 2 says who to report it to.
+
+**2. Who is refusing?** Run the same `printf` in a terminal tab *outside* Herdr.
+
+- **Works outside Herdr, not inside** — Herdr is not relaying a pane's own sequence. Worth a Herdr
+  issue: pane-originated OSC 52 is undocumented, so this is as much a request as a bug report.
+- **Fails in both** — your terminal has OSC 52 writes turned off. Ghostty spells it
+  `clipboard-write` (`allow`/`ask`/`deny`); most terminals have an equivalent.
+
+The picker's status row shows `copy failed · …` only when the write itself errors. A terminal that
+accepts the sequence and silently drops it is indistinguishable from success — that is the price of
+not spawning a clipboard process, and step 1 is how you check it.
 
 ## Engineering notes
 

@@ -97,16 +97,26 @@ where
                 SelectStep::Yank => {
                     // `y` before a selection exists is inert, the way it is in vim's normal mode.
                     if let Some(text) = active.text(&grid) {
-                        copy_selected_text(clipboard, &text)?;
-                        if snapshot.flash_exit_on_yank {
-                            return Ok(PickerOutcome::Copied { text });
+                        match copy_selected_text(clipboard, &text) {
+                            // A failed copy must never close the picker: Herdr tears this pane
+                            // down with it, so a propagated error paints onto a screen that is
+                            // already gone and the dead yank looks like a successful one. Say so
+                            // on the status row instead.
+                            Err(error) => {
+                                notice = Some(format!("copy failed · {}", error.root_cause()));
+                            }
+                            Ok(()) if snapshot.flash_exit_on_yank => {
+                                return Ok(PickerOutcome::Copied { text });
+                            }
+                            // Stay open for the next grab: back to an empty search, with a note on
+                            // the status row so the copy is visibly acknowledged.
+                            Ok(()) => {
+                                notice = Some(format!(
+                                    "copied · {}",
+                                    clip_to_width(text.lines().next().unwrap_or(""), 32)
+                                ));
+                            }
                         }
-                        // Stay open for the next grab: back to an empty search, with a note on
-                        // the status row so the copy is visibly acknowledged.
-                        notice = Some(format!(
-                            "copied · {}",
-                            clip_to_width(text.lines().next().unwrap_or(""), 32)
-                        ));
                         query.clear();
                         selection = None;
                         pending_char = None;
@@ -541,7 +551,7 @@ fn clip_to_width(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clipboard::{ClipboardError, CopySuccess};
+    use crate::clipboard::ClipboardError;
     use crate::model::{
         PaneId, PaneTextCaptureMode, PickerAction, PickerPaneSnapshot, PickerReturnContext,
         SourcePaneSnapshot, StylePalette,
@@ -572,14 +582,16 @@ mod tests {
     #[derive(Default)]
     struct FakeClipboard {
         copied: RefCell<Vec<String>>,
+        failure: Option<ClipboardError>,
     }
 
     impl Clipboard for FakeClipboard {
-        fn copy(&self, text: &str) -> std::result::Result<CopySuccess, ClipboardError> {
+        fn copy(&self, text: &str) -> std::result::Result<(), ClipboardError> {
             self.copied.borrow_mut().push(text.to_string());
-            Ok(CopySuccess {
-                tool: "fake".to_string(),
-            })
+            match &self.failure {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
         }
     }
 
@@ -917,6 +929,40 @@ mod tests {
         assert!(String::from_utf8(output)
             .unwrap()
             .contains("copied · cargo"));
+    }
+
+    #[test]
+    fn failed_yank_reports_on_the_status_row_instead_of_closing() {
+        let clipboard = FakeClipboard {
+            failure: Some(ClipboardError::WriteFailed {
+                message: "broken pipe".to_string(),
+            }),
+            ..FakeClipboard::default()
+        };
+        let mut input = FakeInput::new(vec![
+            PickerInputEvent::Char('c'),
+            PickerInputEvent::Char('a'),
+            PickerInputEvent::Enter,
+            PickerInputEvent::Char('v'),
+            PickerInputEvent::Char('e'),
+            PickerInputEvent::Char('y'),
+            PickerInputEvent::Escape,
+        ]);
+        let mut output = Vec::new();
+
+        // exit_on_yank is on, so a working clipboard would have closed the picker here.
+        let outcome = run_flash_with(
+            &snapshot(vec!["run cargo test"], 80, 4),
+            &mut input,
+            &clipboard,
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, PickerOutcome::Cancelled);
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("copy failed · failed to write the OSC 52 clipboard sequence"));
     }
 
     #[test]

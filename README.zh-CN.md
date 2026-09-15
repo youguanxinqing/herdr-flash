@@ -96,10 +96,8 @@ match = { bg = "none", fg = "#e5c07b" }      # 不填底色 —— 改成纯黄�
 
 - Herdr 0.7.4 或更新版本
 - Rust/Cargo（目前安装时从源码构建，还没有预编译的 release 产物）
-- 一个系统剪贴板命令：
-    - macOS：`pbcopy`
-    - Linux Wayland：`wl-copy`
-    - Linux X11：`xclip` 或 `xsel`
+- 不需要剪贴板命令：`y` 走 OSC 52，由 Herdr 转发给它所连接的终端。所以 `herdr --remote` 打开的
+  pane 复制到的是你面前这台机器，而不是远端主机。
 
 ## 安装
 
@@ -132,6 +130,39 @@ type = "plugin_action"
 command = "youguanxinqing.herdr-flash.flash"
 description = "flash: search visible text, then select and yank"
 ```
+
+## `y` 不复制了怎么办
+
+`y` 不会去调 `pbcopy`/`xclip`。它往自己所在的 pane 写一段 OSC 52 序列，由 Herdr 转发给它所连接
+的终端。OSC 52 是终端标准，不是 Herdr 文档化的插件 API——所以它可能在 Herdr 并不认为自己破坏了
+兼容性的情况下失效。提 issue 之前，两条命令就能分清是哪一段断了。
+
+**1. 这条链到底通不通？** 在任意 Herdr pane 的 shell 里执行：
+
+```sh
+printf '\033]52;c;b3NjNTItd29ya3M=\a'
+```
+
+必须在 pane 的 shell 里**直接敲进去**。套管道、写进 `$(...)`、或者让终端里的 AI 助手代跑都不
+行——输出被那一层截走，序列就到不了终端。
+
+执行后屏幕上什么都不会显示，这段序列本来就是不可见的。然后去别处粘贴。
+
+- **粘出 `osc52-works`** —— 链路没问题，bug 在本插件。请
+  [提 issue](https://github.com/youguanxinqing/herdr-flash/issues)，附上 `herdr --version`
+  和你用的终端。
+- **粘不出来，或者还是旧内容** —— 链路上有一环没转发 OSC 52。改本插件解决不了；第 2 步告诉你该
+  找谁。
+
+**2. 是谁不转发？** 在 **Herdr 之外**开一个终端标签页，跑同一条 `printf`。
+
+- **Herdr 外面能用、里面不能** —— Herdr 没有转发 pane 自己写出的序列。值得给 Herdr 提 issue：
+  pane 侧的 OSC 52 从未被文档化，所以这既是 bug 报告，也是 feature 请求。
+- **里外都不行** —— 你的终端关掉了 OSC 52 写入。Ghostty 里这个开关叫 `clipboard-write`
+  （`allow`/`ask`/`deny`），多数终端都有等价物。
+
+只有**写入本身**出错时，picker 的状态栏才会报 `copy failed · …`。一个收下了序列却默默丢掉的终
+端，跟成功是无法区分的——这是"不 fork 剪贴板进程"换来的代价，第 1 步就是用来验它的。
 
 ## 工程笔记
 

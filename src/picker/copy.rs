@@ -5,7 +5,6 @@ use anyhow::{Context, Result};
 pub(crate) fn copy_selected_text(clipboard: &impl Clipboard, text: &str) -> Result<()> {
     clipboard
         .copy(text)
-        .map(|_| ())
         .map_err(|error| copy_error(text, error))
 }
 
