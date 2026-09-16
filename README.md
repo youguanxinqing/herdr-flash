@@ -94,11 +94,19 @@ Omitted styles and omitted keys keep their defaults; an invalid value is ignored
 
 ## Requirements
 
-- Herdr 0.7.4 or newer
+- Herdr **0.9.0 recommended**; minimum supported version: **0.7.4**
 - Rust/Cargo (installs currently build from source; no prebuilt release assets yet)
 - No clipboard tool: `y` copies over OSC 52, which Herdr relays to the terminal it is attached
   to. That means a `herdr --remote` pane copies to the machine you are sitting at, not the remote
   host.
+
+As of 2026-09-16, Herdr 0.9.0 is the primary tested version, with both client and server on
+0.9.0 and a single connected client. Picker entry, split/zoom layouts, and Escape cleanup have
+been verified live. The current Flash code includes the fix for slow picker entry on 0.9.0.
+Compatibility with 0.7.4 and 0.8.2 is retained; their API behavior and fallback path have been
+checked, but entry performance on those versions has not been benchmarked with this fix.
+With multiple clients connected to 0.9.0, picker entry may still pause while waiting for layout
+updates. See the [compatibility and latency notes](docs/bugs/herdr-090-hidden-layout-latency.md).
 
 ## Install
 

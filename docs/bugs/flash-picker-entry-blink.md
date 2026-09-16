@@ -175,3 +175,7 @@ the zoomed path.
 - `src/model.rs` — distinct source and picker geometry
 - `src/picker/flash.rs` — complete frame composition and four-sided padding
 - `src/renderer/terminal.rs` — synchronized terminal frame emission
+
+For the Herdr 0.9.0 geometry-reconciliation regression, see
+[hidden-layout entry latency](herdr-090-hidden-layout-latency.md). The hidden layout now receives
+a zero-delta resize before the painted wait; the frame/focus barriers remain distinct.

@@ -17,6 +17,14 @@ pub(crate) struct PaneTarget<'a> {
     pane_id: &'a str,
 }
 
+/// A zero-delta resize asks Herdr to refresh PTYs without changing split ratios or focus.
+#[derive(Debug, Serialize)]
+pub(crate) struct GeometryRefreshParams<'a> {
+    pane_id: &'a str,
+    direction: &'static str,
+    amount: f32,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct TabTarget<'a> {
     tab_id: &'a str,
@@ -115,6 +123,12 @@ enum PaneInfoResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+enum PaneResizeResult {
+    PaneResize {},
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum TabInfoResult {
     TabInfo {},
 }
@@ -131,6 +145,18 @@ pub(crate) fn request<P>(id: String, method: &str, params: P) -> Request<'_, P> 
 
 pub(crate) fn pane_target(pane_id: &str) -> PaneTarget<'_> {
     PaneTarget { pane_id }
+}
+
+pub(crate) fn geometry_refresh_params(pane_id: &str) -> GeometryRefreshParams<'_> {
+    GeometryRefreshParams {
+        pane_id,
+        direction: "right",
+        amount: 0.0,
+    }
+}
+
+pub(crate) fn geometry_refreshed(value: Value, id: &str) -> Result<()> {
+    decode::<PaneResizeResult>(value, id).map(|_| ())
 }
 
 pub(crate) fn tab_target(tab_id: &str) -> TabTarget<'_> {
