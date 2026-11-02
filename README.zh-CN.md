@@ -25,11 +25,23 @@ hint 类的选择器会**替你**决定什么算一个 token；Flash 把这件�
 
 ## 流程
 
-1. **搜索** —— 在聚焦的 pane 上触发这个 action，然后直接输入。每个匹配都会高亮，命中后面出现一个单字母标签。Backspace 放宽搜索；Enter 跳到第一个匹配。
+1. **搜索** —— 在聚焦的 pane 上触发这个 action，然后直接输入。每个匹配都会高亮，命中后面出现一个单字母标签。Backspace 放宽搜索；Enter 跳到第一个匹配。搜索范围是当前 tab 里所有可见的 pane，见[多 pane 搜索](#多-pane-搜索)。
 2. **光标** —— 按下某个匹配的标签（或 Enter），光标会落在那个命中的第一个字符上。此时还没有选中任何东西。
 3. **选中并 yank** —— `v` 开始字符选区，`V` 开始行选区。用 vim 动作扩展，然后 `y`（或 Enter）把选区复制到系统剪贴板。
 
 任何阶段按 Escape 或 Ctrl-C 都会退出。
+
+### 多 pane 搜索
+
+> **尚未发布** —— 目前只在 `main` 上，v0.4.1 里没有。想试用：`herdr plugin install youguanxinqing/herdr-flash --ref main`。
+
+Flash 会搜索当前 tab 里所有可见的 pane，而不只是聚焦的那个。
+
+- 每个 pane 都在 Herdr 自己的边框里原地重绘，分屏布局看起来和原来完全一样。
+- 聚焦 pane 的命中优先拿到最靠前的标签，其余 pane 依次往后排。
+- 按下另一个 pane 里的标签，光标就落到那个 pane。移动和选区都限定在这个 pane 内——跨过 pane 边界的文字在屏幕上本来就不连续。想换到别的 pane，按 Backspace 回到搜索。
+- 放大（zoom）的 pane 只搜它自己——屏幕上也只有它一个。
+- 状态栏固定在触发 flash 的那个 pane 底部。
 
 ### 按键
 

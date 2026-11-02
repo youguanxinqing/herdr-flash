@@ -25,11 +25,23 @@ Where hint pickers decide *for* you what a token is, Flash separates the two que
 
 ## The flow
 
-1. **Search** — invoke the action on a focused pane and start typing. Every match highlights, and a one-letter label appears just past each hit. Backspace widens the search; Enter jumps to the first match.
+1. **Search** — invoke the action on a focused pane and start typing. Every match highlights, and a one-letter label appears just past each hit. Backspace widens the search; Enter jumps to the first match. The search covers every pane visible in the tab — see [Multiple panes](#multiple-panes).
 2. **Cursor** — press a match's label (or Enter) and a cursor lands on the first character of that hit. Nothing is selected yet.
 3. **Select and yank** — `v` starts a charwise selection, `V` a linewise one. Extend with vim motions, then `y` (or Enter) copies the selection to the system clipboard.
 
 Escape or Ctrl-C exits from any phase.
+
+### Multiple panes
+
+> **Unreleased** — on `main` only, not in v0.4.1. To try it: `herdr plugin install youguanxinqing/herdr-flash --ref main`.
+
+Flash searches every pane visible in the tab, not just the focused one.
+
+- Each pane is redrawn in place inside Herdr's own borders, so the split layout looks exactly as it did.
+- Hits in the focused pane take the earliest labels; the rest follow pane by pane.
+- A label in another pane lands the cursor there. Motions and the selection stay inside that pane, because text that runs across a pane border was never contiguous on screen. Backspace returns to the search to pick a hit in a different pane.
+- A zoomed pane searches only itself — it is the only pane on screen.
+- The status row stays at the bottom of the pane flash was invoked from.
 
 ### Keys
 

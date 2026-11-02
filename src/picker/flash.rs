@@ -1,7 +1,8 @@
 use crate::clipboard::{Clipboard, SystemClipboard};
 use crate::flash::{assign_labels, find_query_matches, FlashCandidate, FlashLabel};
 use crate::model::{
-    PickerOutcome, PickerSnapshot, RenderLine, RenderSpan, RenderStyle, VisibleViewport,
+    PickerOutcome, PickerSnapshot, RenderLine, RenderSpan, RenderStyle, SiblingPane, StylePalette,
+    VisibleViewport,
 };
 use crate::picker::copy::copy_selected_text;
 use crate::picker::input::{
@@ -13,20 +14,229 @@ use crate::select::{
 };
 use crate::viewport::map_visible_viewport;
 use anyhow::Result;
+use std::fs::File;
 use std::io::{self, Write};
 
+/// A sibling pane the picker paints straight into, through its placeholder's tty.
+pub struct Sibling<S> {
+    pub pane: SiblingPane,
+    pub out: S,
+}
+
+/// A frame destination that can report its live cell size.
+pub trait Surface: Write {
+    /// Live `(cols, rows)`, or `None` when the size is unknown.
+    fn live_size(&self) -> Option<(usize, usize)>;
+}
+
+impl Surface for File {
+    fn live_size(&self) -> Option<(usize, usize)> {
+        let size = rustix::termios::tcgetwinsize(self).ok()?;
+        (size.ws_col > 0 && size.ws_row > 0)
+            .then_some((usize::from(size.ws_col), usize::from(size.ws_row)))
+    }
+}
+
+#[cfg(test)]
+impl Surface for Vec<u8> {
+    fn live_size(&self) -> Option<(usize, usize)> {
+        None
+    }
+}
+
 /// Runs the incremental-search picker against a captured pane snapshot.
-pub fn run_flash_picker(snapshot: &PickerSnapshot) -> Result<PickerOutcome> {
+pub fn run_flash_picker(
+    snapshot: &PickerSnapshot,
+    siblings: &mut [Sibling<File>],
+) -> Result<PickerOutcome> {
     let mut stdout = io::stdout();
     let mut input = CrosstermInputSource;
     let clipboard = SystemClipboard;
     let _raw_mode = RawModeGuard::enable()?;
     let _cursor = CursorGuard::hide()?;
-    run_flash_with(snapshot, &mut input, &clipboard, &mut stdout)
+    run_flash_with(snapshot, siblings, &mut input, &clipboard, &mut stdout)
 }
 
-pub(crate) fn run_flash_with<I, C, W>(
+/// One searchable pane, frozen at launch.
+struct PaneText {
+    viewport: VisibleViewport,
+    grid: Grid,
+    width: u16,
+    height: u16,
+}
+
+impl PaneText {
+    fn new(viewport: VisibleViewport, width: u16, height: u16) -> Self {
+        Self {
+            grid: Grid::new(&viewport.rows),
+            viewport,
+            width,
+            height,
+        }
+    }
+}
+
+/// Every searchable pane — the target first, then its siblings — searched as one text.
+///
+/// Searching the concatenated logical lines is what keeps labels unambiguous tab-wide: a character
+/// that would extend a hit in any pane is withheld from every pane's labels. Putting the target
+/// first hands the pane the user invoked from the earliest, most reachable labels.
+struct Panes {
+    texts: Vec<PaneText>,
+    lines: Vec<String>,
+    /// Index into `lines` of each pane's first logical line.
+    starts: Vec<usize>,
+}
+
+impl Panes {
+    fn new<S>(snapshot: &PickerSnapshot, siblings: &[Sibling<S>]) -> Self {
+        let width = snapshot.source.target_content_width;
+        let height = snapshot.source.target_content_height;
+        // Production snapshots always carry the exact viewport; rebuilding one keeps the unit
+        // tests and any future capture mode from having to special-case flash.
+        let target = snapshot.source.visible_viewport.clone().unwrap_or_else(|| {
+            map_visible_viewport(snapshot.source.logical_lines.clone(), width, height)
+        });
+        let texts = std::iter::once(PaneText::new(target, width, height))
+            .chain(siblings.iter().map(|sibling| {
+                PaneText::new(
+                    sibling.pane.viewport.clone(),
+                    sibling.pane.content_width,
+                    sibling.pane.content_height,
+                )
+            }))
+            .collect::<Vec<_>>();
+        let mut lines = Vec::new();
+        let mut starts = Vec::with_capacity(texts.len());
+        for text in &texts {
+            starts.push(lines.len());
+            lines.extend(text.viewport.logical_lines.iter().cloned());
+        }
+        Self {
+            texts,
+            lines,
+            starts,
+        }
+    }
+
+    /// Maps a tab-wide logical line to `(pane, pane-local line)`.
+    fn locate(&self, line: usize) -> (usize, usize) {
+        let pane = self.starts.partition_point(|&start| start <= line) - 1;
+        (pane, line - self.starts[pane])
+    }
+
+    /// The labels that fall in `pane`, rebased onto its own logical lines.
+    fn labels_in(&self, labels: &[FlashLabel], pane: usize) -> Vec<FlashLabel> {
+        labels
+            .iter()
+            .filter_map(|label| {
+                let (owner, line) = self.locate(label.candidate.line);
+                (owner == pane).then_some(FlashLabel {
+                    label: label.label,
+                    candidate: FlashCandidate {
+                        line,
+                        ..label.candidate
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Lands a bare cursor on the first cell of a hit, in whichever pane holds it.
+    ///
+    /// The search only says where to look; what to take is the user's call, so the picker hands
+    /// over a cursor and waits for `v`. Motions then stay inside that pane: a selection that ran
+    /// across a pane border would yank text that was never contiguous on screen.
+    fn cursor_at(&self, hit: &FlashCandidate) -> Option<(usize, Selection)> {
+        let (pane, line) = self.locate(hit.line);
+        let (start, _end) =
+            token_cell_bounds(&self.texts[pane].viewport, line, hit.start, hit.end)?;
+        Some((
+            pane,
+            Selection::new(Pos {
+                row: start.0,
+                col: start.1,
+            }),
+        ))
+    }
+}
+
+/// What a frame shows: search labels everywhere, or one pane's cursor and selection.
+enum View<'a> {
+    Search(&'a [FlashLabel]),
+    Select {
+        pane: usize,
+        selection: &'a Selection,
+        jumps: &'a [CharJumpTarget],
+    },
+}
+
+/// Renders one pane's body for `view`; panes other than the selecting one stay plain.
+fn pane_content(panes: &Panes, view: &View, index: usize) -> Vec<RenderLine> {
+    let pane = &panes.texts[index];
+    match view {
+        View::Select {
+            pane: active,
+            selection,
+            jumps,
+        } if *active == index => {
+            render_selection(&pane.viewport, selection, jumps, pane.width, pane.height)
+        }
+        View::Select { .. } => render_flash_labels(&pane.viewport, &[], pane.width, pane.height),
+        View::Search(labels) => render_flash_labels(
+            &pane.viewport,
+            &panes.labels_in(labels, index),
+            pane.width,
+            pane.height,
+        ),
+    }
+}
+
+/// Paints one frame into every pane: the target through `output` with the status row pinned to
+/// its bottom, each sibling straight into its own tty.
+fn paint<W: Write, S: Surface>(
+    panes: &Panes,
+    view: &View,
+    status: RenderLine,
+    palette: &StylePalette,
+    output: &mut W,
+    siblings: &mut [Sibling<S>],
+) -> Result<()> {
+    let target = &panes.texts[0];
+    // The snapshot's size and the pane's live size can disagree — resizes propagate
+    // asynchronously — so ask the terminal each frame. Rows pin the status to the real bottom
+    // row; columns bound every emitted row, because frames overwrite in place instead of
+    // clearing: a row wider than the pane would wrap and corrupt the frame, and one narrower
+    // would leave stale cells at the right edge.
+    let (cols, rows) = live_grid(target.width, target.height);
+    let frame = compose_frame(
+        pane_content(panes, view, 0),
+        status,
+        usize::from(target.width),
+        cols,
+        rows,
+    );
+    terminal::emit_render_lines(output, &frame, palette, false)?;
+    output.flush()?;
+
+    for (index, sibling) in siblings.iter_mut().enumerate() {
+        let pane = &panes.texts[index + 1];
+        let (cols, rows) = sibling
+            .out
+            .live_size()
+            .unwrap_or((usize::from(pane.width), usize::from(pane.height)));
+        let frame = fit_body(pane_content(panes, view, index + 1), cols, rows);
+        // ponytail: a sibling write only fails once Herdr is tearing the tab down; the target's
+        // frame is the one the user is driving, so a dead sibling is skipped rather than fatal.
+        let _ = terminal::emit_render_lines(&mut sibling.out, &frame, palette, false)
+            .and_then(|()| Ok(sibling.out.flush()?));
+    }
+    Ok(())
+}
+
+pub(crate) fn run_flash_with<I, C, W, S>(
     snapshot: &PickerSnapshot,
+    siblings: &mut [Sibling<S>],
     input: &mut I,
     clipboard: &C,
     output: &mut W,
@@ -35,58 +245,50 @@ where
     I: InputSource,
     C: Clipboard,
     W: Write,
+    S: Surface,
 {
-    let width = snapshot.source.target_content_width;
-    let height = snapshot.source.target_content_height;
-    // Production snapshots always carry the exact viewport; rebuilding one keeps the unit tests and
-    // any future capture mode from having to special-case flash.
-    let viewport = snapshot.source.visible_viewport.clone().unwrap_or_else(|| {
-        map_visible_viewport(snapshot.source.logical_lines.clone(), width, height)
-    });
-
-    let grid = Grid::new(&viewport.rows);
+    let panes = Panes::new(snapshot, siblings);
+    let source_cols = usize::from(snapshot.source.target_content_width);
     let mut query = String::new();
-    let mut selection: Option<Selection> = None;
+    // The pane the cursor landed in, and the cursor/selection inside it.
+    let mut selection: Option<(usize, Selection)> = None;
     let mut pending_char: Option<CharJump> = None;
     let mut notice: Option<String> = None;
 
     // No entry clear: every frame is fitted to the live terminal size and paints every cell, so
     // the first frame already covers whatever the fresh pane held. A separate clear reaches the
-    // pty as its own write, and the bare cleared screen composites as a visible blank blink.
+    // pty as its own write, and the bare cleared screen composites as a visible blink.
     loop {
-        let candidates = find_query_matches(&viewport.logical_lines, &query);
-        let labels = assign_labels(&viewport.logical_lines, &candidates);
+        let candidates = find_query_matches(&panes.lines, &query);
+        let labels = assign_labels(&panes.lines, &candidates);
 
-        // The snapshot's size and the pane's live size can disagree — resizes propagate
-        // asynchronously — so ask the terminal each frame. Rows pin the status to the real bottom
-        // row; columns bound every emitted row, because frames overwrite in place instead of
-        // clearing: a row wider than the pane would wrap and corrupt the frame, and one narrower
-        // would leave stale cells at the right edge.
-        let (cols, rows) = live_grid(width, height);
-        let content = match &selection {
-            Some(active) => {
+        let (view, status) = match &selection {
+            Some((pane, active)) => {
                 // While a t/f waits on its pick, the pending targets render like flash labels.
                 let jumps = match &pending_char {
                     Some(CharJump::AwaitLabel { targets, .. }) => targets.as_slice(),
                     _ => &[],
                 };
-                render_selection(&viewport, active, jumps, width, height)
+                let view = View::Select {
+                    pane: *pane,
+                    selection: active,
+                    jumps,
+                };
+                let status = legend_line(active, pending_char.as_ref(), &query, source_cols);
+                (view, status)
             }
-            None => render_flash_labels(&viewport, &labels, width, height),
+            None => (
+                View::Search(&labels),
+                prompt_line(&labels, &query, notice.as_deref(), source_cols),
+            ),
         };
-        let source_cols = width as usize;
-        let status = match &selection {
-            Some(active) => legend_line(active, pending_char.as_ref(), &query, source_cols),
-            None => prompt_line(&labels, &query, notice.as_deref(), source_cols),
-        };
-        let lines = compose_frame(content, status, source_cols, cols, rows);
-        terminal::emit_render_lines(output, &lines, &snapshot.palette, false)?;
-        output.flush()?;
+        paint(&panes, &view, status, &snapshot.palette, output, siblings)?;
 
         let event = input.read_event()?;
 
-        if let Some(active) = selection.as_mut() {
-            let step = select_step(active, &grid, &mut pending_char, event);
+        if let Some((pane, active)) = selection.as_mut() {
+            let grid = &panes.texts[*pane].grid;
+            let step = select_step(active, grid, &mut pending_char, event);
             match step {
                 SelectStep::Continue => {}
                 SelectStep::Cancel => return Ok(PickerOutcome::Cancelled),
@@ -96,7 +298,7 @@ where
                 }
                 SelectStep::Yank => {
                     // `y` before a selection exists is inert, the way it is in vim's normal mode.
-                    if let Some(text) = active.text(&grid) {
+                    if let Some(text) = active.text(grid) {
                         match copy_selected_text(clipboard, &text) {
                             // A failed copy must never close the picker: Herdr tears this pane
                             // down with it, so a propagated error paints onto a screen that is
@@ -136,13 +338,13 @@ where
             }
             PickerInputEvent::Enter => {
                 if let Some(first) = labels.first() {
-                    selection = cursor_at(&viewport, &first.candidate);
+                    selection = panes.cursor_at(&first.candidate);
                 }
             }
             PickerInputEvent::Char(ch) => {
                 notice = None;
                 match labels.iter().find(|label| label.label == ch) {
-                    Some(hit) => selection = cursor_at(&viewport, &hit.candidate),
+                    Some(hit) => selection = panes.cursor_at(&hit.candidate),
                     // A label character can never also extend a match, so anything unlabeled is a
                     // search keystroke.
                     None => query.push(ch),
@@ -156,26 +358,27 @@ where
 /// Paints the initial search frame — empty query, no selection — for the entry preview.
 ///
 /// Runs before the launch barrier, so it must not touch input or terminal modes; it only writes
-/// the same frame the interactive loop would paint first, fitted to the live terminal size.
-pub(crate) fn emit_entry_preview<W: Write>(
+/// the same frame the interactive loop would paint first, into every pane, fitted to live sizes.
+pub(crate) fn emit_entry_preview<W: Write, S: Surface>(
     snapshot: &PickerSnapshot,
+    siblings: &mut [Sibling<S>],
     output: &mut W,
 ) -> Result<()> {
-    let width = snapshot.source.target_content_width;
-    let height = snapshot.source.target_content_height;
-    let viewport = snapshot.source.visible_viewport.clone().unwrap_or_else(|| {
-        map_visible_viewport(snapshot.source.logical_lines.clone(), width, height)
-    });
-    let candidates = find_query_matches(&viewport.logical_lines, "");
-    let labels = assign_labels(&viewport.logical_lines, &candidates);
-    let (cols, rows) = live_grid(width, height);
-    let content = render_flash_labels(&viewport, &labels, width, height);
-    let source_cols = width as usize;
-    let status = prompt_line(&labels, "", None, source_cols);
-    let lines = compose_frame(content, status, source_cols, cols, rows);
-    terminal::emit_render_lines(output, &lines, &snapshot.palette, false)?;
-    output.flush()?;
-    Ok(())
+    let panes = Panes::new(snapshot, siblings);
+    let status = prompt_line(
+        &[],
+        "",
+        None,
+        usize::from(snapshot.source.target_content_width),
+    );
+    paint(
+        &panes,
+        &View::Search(&[]),
+        status,
+        &snapshot.palette,
+        output,
+        siblings,
+    )
 }
 
 /// Live terminal size in cells, falling back to the snapshot's dimensions, never zero.
@@ -233,18 +436,6 @@ enum CharJump {
         target: char,
         targets: Vec<CharJumpTarget>,
     },
-}
-
-/// Lands a bare cursor on the first cell of a match, selecting nothing.
-///
-/// The search only says where to look; what to take is the user's call, so the picker hands over a
-/// cursor and waits for `v`.
-fn cursor_at(viewport: &VisibleViewport, hit: &FlashCandidate) -> Option<Selection> {
-    let (start, _end) = token_cell_bounds(viewport, hit.line, hit.start, hit.end)?;
-    Some(Selection::new(Pos {
-        row: start.0,
-        col: start.1,
-    }))
 }
 
 fn select_step(
@@ -392,6 +583,17 @@ fn compose_frame(
         live_cols,
         has_side_padding,
     ));
+    lines
+}
+
+/// Fits a sibling frame to its live pane: no status row, every row clipped or padded to `cols`.
+fn fit_body(content: Vec<RenderLine>, cols: usize, rows: usize) -> Vec<RenderLine> {
+    let mut lines = content
+        .into_iter()
+        .take(rows)
+        .map(|line| fit_row(line, cols))
+        .collect::<Vec<_>>();
+    lines.resize_with(rows, || blank_row(cols));
     lines
 }
 
@@ -554,7 +756,7 @@ mod tests {
     use crate::clipboard::ClipboardError;
     use crate::model::{
         PaneId, PaneTextCaptureMode, PickerAction, PickerPaneSnapshot, PickerReturnContext,
-        SourcePaneSnapshot, StylePalette,
+        SourcePaneSnapshot,
     };
     use anyhow::anyhow;
     use std::cell::RefCell;
@@ -607,6 +809,7 @@ mod tests {
                 logical_lines: lines.into_iter().map(str::to_string).collect(),
                 visible_viewport: None,
                 capture_mode: PaneTextCaptureMode::ExactVisibleUnwrapped,
+                siblings: Vec::new(),
             },
             picker: PickerPaneSnapshot {
                 content_width: width,
@@ -623,6 +826,11 @@ mod tests {
         }
     }
 
+    /// No sibling panes: the single-pane picker.
+    fn none() -> Vec<Sibling<Vec<u8>>> {
+        Vec::new()
+    }
+
     fn line_text(line: &RenderLine) -> String {
         line.spans.iter().map(|span| span.text.as_str()).collect()
     }
@@ -631,10 +839,146 @@ mod tests {
         let clipboard = FakeClipboard::default();
         let mut input = FakeInput::new(events);
         let mut output = Vec::new();
-        let outcome =
-            run_flash_with(&snapshot(lines, 80, 4), &mut input, &clipboard, &mut output).unwrap();
+        let outcome = run_flash_with(
+            &snapshot(lines, 80, 4),
+            &mut none(),
+            &mut input,
+            &clipboard,
+            &mut output,
+        )
+        .unwrap();
         let copied = clipboard.copied.borrow().clone();
         (outcome, copied)
+    }
+
+    fn sibling(rows: Vec<&str>, width: u16, height: u16) -> Sibling<Vec<u8>> {
+        Sibling {
+            pane: SiblingPane {
+                pane_id: PaneId::new("p2"),
+                content_width: width,
+                content_height: height,
+                viewport: map_visible_viewport(
+                    rows.into_iter().map(str::to_string).collect(),
+                    width,
+                    height,
+                ),
+            },
+            out: Vec::new(),
+        }
+    }
+
+    fn run_with_sibling(
+        events: Vec<PickerInputEvent>,
+        target: Vec<&str>,
+        other: Vec<&str>,
+    ) -> (PickerOutcome, String) {
+        let clipboard = FakeClipboard::default();
+        let mut input = FakeInput::new(events);
+        let mut siblings = vec![sibling(other, 40, 3)];
+        let outcome = run_flash_with(
+            &snapshot(target, 40, 3),
+            &mut siblings,
+            &mut input,
+            &clipboard,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let painted = String::from_utf8(siblings.remove(0).out).unwrap();
+        (outcome, painted)
+    }
+
+    #[test]
+    fn a_label_in_a_sibling_pane_lands_the_cursor_there() {
+        // Both panes hold "cargo": the target's hit takes 'a', the sibling's 's'. A linewise yank
+        // after 's' proves the cursor and its motions moved into the sibling's own rows.
+        let (outcome, painted) = run_with_sibling(
+            vec![
+                PickerInputEvent::Char('c'),
+                PickerInputEvent::Char('a'),
+                PickerInputEvent::Char('r'),
+                PickerInputEvent::Char('g'),
+                PickerInputEvent::Char('o'),
+                PickerInputEvent::Char('s'),
+                PickerInputEvent::Char('V'),
+                PickerInputEvent::Char('y'),
+            ],
+            vec!["run cargo"],
+            vec!["deploy cargo now"],
+        );
+
+        assert_eq!(
+            outcome,
+            PickerOutcome::Copied {
+                text: "deploy cargo now".to_string()
+            }
+        );
+        // The sibling is painted through its own surface, without the target's status row.
+        assert!(painted.contains("deploy cargo now"));
+        assert!(!painted.contains("type to search"));
+    }
+
+    #[test]
+    fn a_character_extending_a_sibling_hit_is_never_a_label() {
+        // "alp" continues with 'h' in the target and 's' in the sibling. 's' must stay a search
+        // key in every pane, so it narrows to the sibling's "alps" instead of jumping.
+        let (outcome, _) = run_with_sibling(
+            vec![
+                PickerInputEvent::Char('a'),
+                PickerInputEvent::Char('l'),
+                PickerInputEvent::Char('p'),
+                PickerInputEvent::Char('s'),
+                PickerInputEvent::Enter,
+                PickerInputEvent::Char('V'),
+                PickerInputEvent::Char('y'),
+            ],
+            vec!["alpha"],
+            vec!["alps"],
+        );
+
+        assert_eq!(
+            outcome,
+            PickerOutcome::Copied {
+                text: "alps".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn the_entry_preview_paints_every_pane() {
+        let mut target = Vec::new();
+        let mut siblings = vec![sibling(vec!["sibling text"], 30, 3)];
+        emit_entry_preview(
+            &snapshot(vec!["target text"], 30, 3),
+            &mut siblings,
+            &mut target,
+        )
+        .unwrap();
+
+        let target = String::from_utf8(target).unwrap();
+        let sibling = String::from_utf8(siblings.remove(0).out).unwrap();
+        assert!(target.contains("target text") && target.contains("type to search"));
+        assert!(sibling.contains("sibling text") && !sibling.contains("type to search"));
+        assert!(
+            !sibling.contains("\u{1b}[2J"),
+            "a sibling clear would blink too"
+        );
+    }
+
+    #[test]
+    fn sibling_frames_cover_exactly_the_pane() {
+        let frame = fit_body(
+            vec![fill_row(
+                vec![("abcdef".to_string(), RenderStyle::Unmatched)],
+                6,
+            )],
+            4,
+            3,
+        );
+
+        assert_eq!(frame.len(), 3);
+        for line in &frame {
+            assert_eq!(crate::hints::display_width(&line_text(line)), 4);
+        }
     }
 
     #[test]
@@ -707,6 +1051,7 @@ mod tests {
 
         let outcome = run_flash_with(
             &snapshot(vec!["run cargo now"], 80, 4),
+            &mut none(),
             &mut input,
             &clipboard,
             &mut output,
@@ -773,6 +1118,7 @@ mod tests {
 
         let outcome = run_flash_with(
             &snapshot(vec![row.as_str()], 80, 4),
+            &mut none(),
             &mut input,
             &clipboard,
             &mut output,
@@ -809,6 +1155,7 @@ mod tests {
 
         let outcome = run_flash_with(
             &snapshot(vec!["one two now"], 80, 4),
+            &mut none(),
             &mut input,
             &clipboard,
             &mut output,
@@ -918,7 +1265,8 @@ mod tests {
         ]);
         let mut output = Vec::new();
 
-        let outcome = run_flash_with(&snapshot, &mut input, &clipboard, &mut output).unwrap();
+        let outcome =
+            run_flash_with(&snapshot, &mut none(), &mut input, &clipboard, &mut output).unwrap();
 
         assert_eq!(outcome, PickerOutcome::Cancelled);
         assert_eq!(
@@ -953,6 +1301,7 @@ mod tests {
         // exit_on_yank is on, so a working clipboard would have closed the picker here.
         let outcome = run_flash_with(
             &snapshot(vec!["run cargo test"], 80, 4),
+            &mut none(),
             &mut input,
             &clipboard,
             &mut output,
@@ -1013,7 +1362,12 @@ mod tests {
     #[test]
     fn the_entry_preview_paints_the_initial_search_frame() {
         let mut output = Vec::new();
-        emit_entry_preview(&snapshot(vec!["run cargo test"], 40, 3), &mut output).unwrap();
+        emit_entry_preview(
+            &snapshot(vec!["run cargo test"], 40, 3),
+            &mut none(),
+            &mut output,
+        )
+        .unwrap();
         let rendered = String::from_utf8(output).unwrap();
 
         assert!(rendered.contains("run cargo test"));
@@ -1227,6 +1581,7 @@ mod tests {
         let mut output = Vec::new();
         run_flash_with(
             &snapshot(vec!["run cargo test"], 80, 3),
+            &mut none(),
             &mut input,
             &clipboard,
             &mut output,
@@ -1320,6 +1675,7 @@ mod tests {
         let mut output = Vec::new();
         run_flash_with(
             &snapshot(vec!["alpha"], 40, 3),
+            &mut none(),
             &mut input,
             &clipboard,
             &mut output,

@@ -58,7 +58,11 @@ pub enum Command {
 
     /// Internal shell-free placeholder for non-picker panes.
     #[command(hide = true)]
-    Idle,
+    Idle {
+        /// Publish this pane's tty path here so the picker can paint the pane directly.
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -88,7 +92,7 @@ pub fn run_with(cli: Cli) -> Result<()> {
         } => {
             adapter.run_picker_from_snapshot(&snapshot, &ready, &painted)?;
         }
-        Command::Idle => crate::herdr::run_idle()?,
+        Command::Idle { report } => crate::herdr::run_idle(report.as_deref())?,
     }
 
     Ok(())

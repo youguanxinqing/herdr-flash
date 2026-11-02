@@ -11,10 +11,14 @@ use crate::config::{resolve_flash_exit_on_yank, resolve_palette, resolve_pattern
 use crate::herdr::client::SocketHerdrClient;
 use crate::herdr::context::HerdrContext;
 use crate::herdr::executor::{cleanup_session, launch_layout_tab_picker, run_snapshot_picker};
-use crate::herdr::snapshot::{read_snapshot_file, wait_for_ready, PickerLaunchFiles};
-use crate::model::{PaneId, PickerAction};
+use crate::herdr::snapshot::{
+    open_sibling_tty, read_snapshot_file, report_sibling_tty, wait_for_ready, PickerLaunchFiles,
+};
+use crate::model::{PaneId, PickerAction, PickerSnapshot};
+use crate::picker::{Sibling, Surface};
 use anyhow::{bail, Context, Result};
 use crossterm::{cursor, execute, terminal};
+use std::fs::File;
 use std::io::{stdout, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -96,16 +100,21 @@ impl HerdrAdapter {
             snapshot_path.to_path_buf(),
             ready_path.to_path_buf(),
             painted_path.to_path_buf(),
-        );
+        )
+        .with_sibling_reports(snapshot.source.siblings.len());
         // layout.apply keeps this tab hidden. Wait for Herdr's asynchronous PTY resize, paint the
         // complete first frame, then tell the action process it can switch tabs without exposing
         // an empty or mis-sized pane. Preview failure remains best-effort so launch can fall back.
+        let deadline = Instant::now() + Duration::from_millis(250);
         let preview = wait_for_terminal_size(
             snapshot.picker.content_width,
             snapshot.picker.content_height,
             Duration::from_millis(250),
-        )
-        .and_then(|_| crate::picker::paint_entry_preview(&snapshot));
+        );
+        // Siblings share the same budget: their placeholders start alongside this process.
+        let mut siblings = attach_siblings(&snapshot, &files, deadline);
+        let preview =
+            preview.and_then(|_| crate::picker::paint_entry_preview(&snapshot, &mut siblings));
         if let Err(error) = preview {
             eprintln!("Herdr Flash: entry preview failed: {error:#}");
         }
@@ -122,12 +131,13 @@ impl HerdrAdapter {
         let reentry_guard = lock::PickerTabLock::acquire(&temp_tab);
         let mut client = SocketHerdrClient::from_context(&self.context)?;
         let primary = wait_for_ready(ready_path, Duration::from_secs(10))
-            .and_then(|_| run_snapshot_picker(&snapshot));
+            .and_then(|_| run_snapshot_picker(&snapshot, &mut siblings));
         // Released before close_tab: Herdr may kill this process together with its tab, and the
-        // Drop fallback would never run.
+        // Drop fallback would never run. The launch files go first for the same reason — removed
+        // after close_tab, they leaked into the temp dir on every run.
         drop(reentry_guard);
-        let cleanup = cleanup_session(&mut client, &snapshot.session, &temp_tab);
         let files_cleanup = files.cleanup();
+        let cleanup = cleanup_session(&mut client, &snapshot.session, &temp_tab);
         match primary {
             Err(e) => {
                 if let Err(c) = cleanup {
@@ -171,15 +181,68 @@ fn wait_for_terminal_size(width: u16, height: u16, timeout: Duration) -> Result<
     }
 }
 
+/**
+ * Opens every sibling placeholder that reports in before `deadline` and waits, within the same
+ * deadline, for each to reach its captured size.
+ *
+ * A sibling that never reports is left out: its pane stays blank and its text is not searched,
+ * which is the single-pane picker. A sibling still mid-resize is kept, because every frame is
+ * fitted to its live size anyway.
+ */
+fn attach_siblings(
+    snapshot: &PickerSnapshot,
+    files: &PickerLaunchFiles,
+    deadline: Instant,
+) -> Vec<Sibling<File>> {
+    let attached = snapshot
+        .source
+        .siblings
+        .iter()
+        .zip(&files.sibling_reports)
+        .filter_map(|(pane, report)| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match open_sibling_tty(report, remaining) {
+                Ok(out) => Some(Sibling {
+                    pane: pane.clone(),
+                    out,
+                }),
+                Err(error) => {
+                    eprintln!("Herdr Flash: pane {} left out: {error:#}", pane.pane_id);
+                    None
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    for sibling in &attached {
+        let expected = (
+            usize::from(sibling.pane.content_width),
+            usize::from(sibling.pane.content_height),
+        );
+        while sibling.out.live_size() != Some(expected) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    attached
+}
+
 /// Clears an inert pane and remains alive until Herdr closes its tab.
-pub fn run_idle() -> Result<()> {
+///
+/// With `report`, the pane is a flash sibling: once blank, it publishes its tty so the picker can
+/// paint it. Clearing first matters — a clear arriving after the picker's frame would erase it.
+pub fn run_idle(report: Option<&Path>) -> Result<()> {
     let mut out = stdout();
     execute!(
         out,
         terminal::Clear(terminal::ClearType::All),
-        cursor::MoveTo(0, 0)
+        cursor::MoveTo(0, 0),
+        cursor::Hide
     )?;
     out.flush()?;
+    // Exiting would close this pane and reflow the picker's layout, so a failed report only
+    // leaves the pane out of the search.
+    if let Some(Err(error)) = report.map(report_sibling_tty) {
+        eprintln!("Herdr Flash: {error:#}");
+    }
     loop {
         std::thread::sleep(Duration::from_secs(3600));
     }

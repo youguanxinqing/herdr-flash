@@ -123,6 +123,22 @@ pub struct SourcePaneSnapshot {
     pub logical_lines: Vec<String>,
     pub visible_viewport: Option<VisibleViewport>,
     pub capture_mode: PaneTextCaptureMode,
+    /// Other visible panes of the tab that flash searches alongside the target. Empty for a
+    /// single-pane or zoomed tab, where the target is the only pane on screen.
+    #[serde(default)]
+    pub siblings: Vec<SiblingPane>,
+}
+
+/// A non-target pane captured for a tab-wide flash search.
+///
+/// The temporary layout replays the source split tree, so this pane's placeholder has exactly the
+/// captured content size; the picker paints it directly through the placeholder's tty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiblingPane {
+    pub pane_id: PaneId,
+    pub content_width: u16,
+    pub content_height: u16,
+    pub viewport: VisibleViewport,
 }
 
 /// Exact visible pane rows plus the logical lines reconstructed from soft wraps.

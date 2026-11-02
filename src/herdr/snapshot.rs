@@ -1,10 +1,12 @@
 use crate::herdr::layout::{derive_source_geometry, derive_source_pane_geometries, LayoutSnapshot};
 use crate::model::{
     PaneId, PaneTextCaptureMode, PatternSpec, PickerAction, PickerPaneSnapshot,
-    PickerReturnContext, PickerSnapshot, SourcePaneSnapshot, StylePalette, VisibleViewport,
+    PickerReturnContext, PickerSnapshot, SiblingPane, SourcePaneSnapshot, StylePalette,
+    VisibleViewport,
 };
 use anyhow::{bail, Context, Result};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -18,6 +20,8 @@ pub struct PickerLaunchFiles {
     pub snapshot_path: PathBuf,
     pub ready_path: PathBuf,
     pub painted_path: PathBuf,
+    /// Where each sibling placeholder publishes its tty path, in `siblings` order.
+    pub sibling_reports: Vec<PathBuf>,
     ready_temp_path: PathBuf,
     painted_temp_path: PathBuf,
 }
@@ -32,7 +36,9 @@ impl PickerLaunchFiles {
             painted_path: std::env::temp_dir().join(format!("{stem}.painted")),
             ready_temp_path: std::env::temp_dir().join(format!("{stem}.ready.tmp")),
             painted_temp_path: std::env::temp_dir().join(format!("{stem}.painted.tmp")),
-        };
+            sibling_reports: Vec::new(),
+        }
+        .with_sibling_reports(snapshot.source.siblings.len());
         files.cleanup()?;
         let json = serde_json::to_vec(snapshot).context("failed to serialize picker snapshot")?;
         fs::write(&files.snapshot_path, json)
@@ -48,7 +54,20 @@ impl PickerLaunchFiles {
             painted_temp_path: painted_path.with_extension("painted.tmp"),
             ready_path,
             painted_path,
+            sibling_reports: Vec::new(),
         }
+    }
+
+    /// Derives the sibling report paths from the snapshot path, so the action and picker
+    /// processes agree on them without passing one argument per pane.
+    pub fn with_sibling_reports(mut self, count: usize) -> Self {
+        self.sibling_reports = (0..count)
+            .map(|index| {
+                self.snapshot_path
+                    .with_extension(format!("sibling{index}.tty"))
+            })
+            .collect();
+        self
     }
 
     /// Atomically releases the picker after its painted tab receives focus.
@@ -72,7 +91,10 @@ impl PickerLaunchFiles {
             &self.painted_path,
             &self.ready_temp_path,
             &self.painted_temp_path,
-        ] {
+        ]
+        .into_iter()
+        .chain(&self.sibling_reports)
+        {
             if let Err(error) = remove_file(path) {
                 if first.is_none() {
                     first = Some(error);
@@ -87,6 +109,27 @@ fn signal_marker(temp_path: &Path, marker_path: &Path, payload: &[u8]) -> Result
     fs::write(temp_path, payload)?;
     fs::rename(temp_path, marker_path)
         .with_context(|| format!("failed to publish marker at {}", marker_path.display()))
+}
+
+/// Publishes this placeholder pane's tty path so the picker can paint the pane directly.
+pub fn report_sibling_tty(report: &Path) -> Result<()> {
+    let tty = rustix::termios::ttyname(std::io::stdin(), Vec::new())
+        .context("placeholder pane has no tty")?;
+    signal_marker(&report.with_extension("tty.tmp"), report, tty.as_bytes())
+        .context("failed to report placeholder tty")
+}
+
+/// Waits a bounded duration for a sibling placeholder's report, then opens its tty for writing.
+pub fn open_sibling_tty(report: &Path, timeout: Duration) -> Result<File> {
+    wait_for_marker(report, timeout, "sibling pane tty report")?;
+    let tty = fs::read_to_string(report)
+        .with_context(|| format!("failed to read {}", report.display()))?;
+    OpenOptions::new()
+        .write(true)
+        // The picker already owns its own controlling terminal; never adopt a sibling's.
+        .custom_flags(rustix::fs::OFlags::NOCTTY.bits() as i32)
+        .open(&tty)
+        .with_context(|| format!("failed to open sibling tty {tty}"))
 }
 
 /// Waits a bounded duration for the launch barrier.
@@ -105,7 +148,10 @@ fn wait_for_marker(path: &Path, timeout: Duration, description: &str) -> Result<
         if started.elapsed() >= timeout {
             bail!("timed out waiting for {description} at {}", path.display());
         }
-        thread::sleep(Duration::from_millis(10));
+        // Every launch-path marker is on the critical path to the first visible frame, and the
+        // writer usually lands a few ms after the first check: a 10 ms nap added most of a tick
+        // per marker. A 1 ms stat loop costs nothing next to that.
+        thread::sleep(Duration::from_millis(1));
     }
     Ok(())
 }
@@ -121,6 +167,7 @@ pub fn build_source_snapshot(
     custom_patterns: Vec<PatternSpec>,
     flash_exit_on_yank: bool,
     palette: StylePalette,
+    siblings: Vec<SiblingPane>,
 ) -> Result<PickerSnapshot> {
     let source_tab_id = layout
         .tab_id
@@ -153,6 +200,7 @@ pub fn build_source_snapshot(
             logical_lines,
             visible_viewport,
             capture_mode: PaneTextCaptureMode::ExactVisibleUnwrapped,
+            siblings,
         },
         picker: PickerPaneSnapshot {
             content_width: picker_content_rect.width,
@@ -205,6 +253,7 @@ mod tests {
                 logical_lines: Vec::new(),
                 visible_viewport: None,
                 capture_mode: PaneTextCaptureMode::ExactVisibleUnwrapped,
+                siblings: Vec::new(),
             },
             picker: PickerPaneSnapshot {
                 content_width: 80,
@@ -230,6 +279,24 @@ mod tests {
         wait_for_ready(&files.ready_path, Duration::from_secs(1)).unwrap();
         files.cleanup().unwrap();
         files.cleanup().unwrap();
+    }
+
+    #[test]
+    fn sibling_reports_sit_beside_the_snapshot_and_are_cleaned_up() {
+        let files = PickerLaunchFiles::from_paths(
+            std::env::temp_dir().join(format!("flash-sib-{}.json", std::process::id())),
+            "unused.ready".into(),
+            "unused.painted".into(),
+        )
+        .with_sibling_reports(2);
+        assert_eq!(
+            files.sibling_reports[1].file_name().unwrap(),
+            format!("flash-sib-{}.sibling1.tty", std::process::id()).as_str()
+        );
+
+        fs::write(&files.sibling_reports[0], b"/dev/ttys000").unwrap();
+        files.cleanup().unwrap();
+        assert!(!files.sibling_reports[0].exists());
     }
 
     #[test]

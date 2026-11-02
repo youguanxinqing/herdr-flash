@@ -200,6 +200,7 @@ mod tests {
                 logical_lines: lines.into_iter().map(str::to_string).collect(),
                 visible_viewport: None,
                 capture_mode: PaneTextCaptureMode::RecentUnwrappedBottomApproximation,
+                siblings: Vec::new(),
             },
             picker: PickerPaneSnapshot {
                 content_width: width,

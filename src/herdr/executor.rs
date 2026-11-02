@@ -1,12 +1,17 @@
 use crate::herdr::client::{HerdrClient, LaunchLayoutNode};
-use crate::herdr::layout::{derive_layout_recreation_plan, derive_source_geometry};
+use crate::herdr::layout::{
+    derive_layout_recreation_plan, derive_source_geometry, derive_source_pane_geometries,
+    LayoutSnapshot,
+};
 use crate::herdr::snapshot::{build_source_snapshot, wait_for_painted, PickerLaunchFiles};
 use crate::model::{
     LayoutNode, PaneId, PatternSpec, PickerAction, PickerReturnContext, PickerSnapshot,
-    StylePalette,
+    SiblingPane, StylePalette,
 };
+use crate::picker::Sibling;
 use crate::viewport::map_visible_viewport;
 use anyhow::{bail, Context, Result};
+use std::fs::File;
 use std::path::Path;
 use std::time::Duration;
 
@@ -64,6 +69,13 @@ pub fn launch_layout_tab_picker<C: HerdrClient>(
         return_pane_id: target.clone(),
     };
 
+    // Flash searches every pane on screen. A zoomed source shows only the target, so it has no
+    // siblings; the hidden pattern pickers stay single-pane.
+    let siblings = match (&plan, action) {
+        (Some(_), PickerAction::Flash) => capture_siblings(client, &layout, target),
+        _ => Vec::new(),
+    };
+
     let snapshot = build_source_snapshot(
         &layout,
         target,
@@ -74,28 +86,38 @@ pub fn launch_layout_tab_picker<C: HerdrClient>(
         custom_patterns,
         flash_exit_on_yank,
         palette,
+        siblings,
     )?;
 
     let files = PickerLaunchFiles::create(&snapshot)?;
 
+    let picker = picker_layout_node(
+        binary_path,
+        &files.snapshot_path,
+        &files.ready_path,
+        &files.painted_path,
+    );
     let root = match plan {
-        Some(plan) => convert_layout(
-            &plan.root,
-            target,
-            binary_path,
-            &files.snapshot_path,
-            &files.ready_path,
-            &files.painted_path,
-        ),
+        Some(plan) => {
+            let reports = snapshot
+                .source
+                .siblings
+                .iter()
+                .zip(&files.sibling_reports)
+                .collect::<Vec<_>>();
+            let idle = |pane: &PaneId| {
+                let report = reports
+                    .iter()
+                    .find(|(sibling, _)| sibling.pane_id == *pane)
+                    .map(|(_, path)| path.as_path());
+                idle_layout_node(binary_path, report)
+            };
+            convert_layout(&plan.root, target, &picker, &idle)
+        }
         // A zoomed source already occupies the full content area. Replaying its hidden split tree
         // and zooming after focus creates a second visible resize; one picker pane has the same
         // final geometry without that transition.
-        None => picker_layout_node(
-            binary_path,
-            &files.snapshot_path,
-            &files.ready_path,
-            &files.painted_path,
-        ),
+        None => picker,
     };
 
     let workspace_id = layout
@@ -139,21 +161,49 @@ pub fn launch_layout_tab_picker<C: HerdrClient>(
     Ok(())
 }
 
+/// Captures every other pane's visible text so flash can search the whole tab.
+///
+/// A pane that cannot be read is left out rather than failing the launch: it stays a blank
+/// placeholder, exactly as in the single-pane picker.
+fn capture_siblings<C: HerdrClient>(
+    client: &mut C,
+    layout: &LayoutSnapshot,
+    target: &PaneId,
+) -> Vec<SiblingPane> {
+    derive_source_pane_geometries(layout)
+        .into_iter()
+        .filter(|pane| pane.pane_id != *target && pane.content_height > 0)
+        .filter_map(|pane| {
+            let text = client
+                .pane_read_visible(&pane.pane_id, pane.content_height)
+                .map_err(|error| {
+                    eprintln!("Herdr Flash: skipping pane {}: {error:#}", pane.pane_id)
+                })
+                .ok()?;
+            Some(SiblingPane {
+                viewport: map_visible_viewport(
+                    text.lines().map(str::to_string).collect(),
+                    pane.content_width,
+                    pane.content_height,
+                ),
+                pane_id: pane.pane_id,
+                content_width: pane.content_width,
+                content_height: pane.content_height,
+            })
+        })
+        .collect()
+}
+
+/// Replays the source split tree: the target leaf runs the picker, every other leaf a placeholder.
 fn convert_layout(
     node: &LayoutNode,
     target: &PaneId,
-    binary: &Path,
-    snapshot: &Path,
-    ready: &Path,
-    painted: &Path,
+    picker: &LaunchLayoutNode,
+    idle: &dyn Fn(&PaneId) -> LaunchLayoutNode,
 ) -> LaunchLayoutNode {
     match node {
-        LayoutNode::Pane { source_pane_id, .. } if source_pane_id == target => {
-            picker_layout_node(binary, snapshot, ready, painted)
-        }
-        LayoutNode::Pane { .. } => LaunchLayoutNode::Pane {
-            command: vec![binary.to_string_lossy().into_owned(), "idle".into()],
-        },
+        LayoutNode::Pane { source_pane_id, .. } if source_pane_id == target => picker.clone(),
+        LayoutNode::Pane { source_pane_id, .. } => idle(source_pane_id),
         LayoutNode::Split {
             direction,
             ratio,
@@ -163,14 +213,20 @@ fn convert_layout(
         } => LaunchLayoutNode::Split {
             direction: *direction,
             ratio: *ratio,
-            first: Box::new(convert_layout(
-                first, target, binary, snapshot, ready, painted,
-            )),
-            second: Box::new(convert_layout(
-                second, target, binary, snapshot, ready, painted,
-            )),
+            first: Box::new(convert_layout(first, target, picker, idle)),
+            second: Box::new(convert_layout(second, target, picker, idle)),
         },
     }
+}
+
+/// Placeholder leaf; with a report path it publishes its tty so the picker can paint it.
+fn idle_layout_node(binary: &Path, report: Option<&Path>) -> LaunchLayoutNode {
+    let mut command = vec![binary.to_string_lossy().into_owned(), "idle".into()];
+    if let Some(report) = report {
+        command.push("--report".into());
+        command.push(report.to_string_lossy().into_owned());
+    }
+    LaunchLayoutNode::Pane { command }
 }
 
 fn picker_layout_node(
@@ -193,10 +249,7 @@ fn picker_layout_node(
     }
 }
 
-fn layout_target_is_focused(
-    layout: &crate::herdr::layout::LayoutSnapshot,
-    target: &PaneId,
-) -> bool {
+fn layout_target_is_focused(layout: &LayoutSnapshot, target: &PaneId) -> bool {
     layout
         .focused_pane_id
         .as_ref()
@@ -239,9 +292,12 @@ pub fn cleanup_session<C: HerdrClient>(
     first.map_or(Ok(()), Err)
 }
 
-pub fn run_snapshot_picker(snapshot: &PickerSnapshot) -> Result<()> {
+pub fn run_snapshot_picker(
+    snapshot: &PickerSnapshot,
+    siblings: &mut [Sibling<File>],
+) -> Result<()> {
     match snapshot.action {
-        PickerAction::Flash => crate::picker::run_flash_picker(snapshot).map(|_| ()),
+        PickerAction::Flash => crate::picker::run_flash_picker(snapshot, siblings).map(|_| ()),
         PickerAction::Copy | PickerAction::OpenUrl => {
             crate::picker::run_picker(snapshot).map(|_| ())
         }
@@ -379,6 +435,7 @@ mod tests {
                     segments: Vec::new(),
                 }),
                 capture_mode: PaneTextCaptureMode::ExactVisibleUnwrapped,
+                siblings: Vec::new(),
             },
             picker: PickerPaneSnapshot {
                 content_width: 80,
@@ -410,14 +467,16 @@ mod tests {
             }),
             rect: Rect::new(0, 0, 2, 1),
         };
-        let converted = convert_layout(
-            &tree,
-            &PaneId::new("b"),
-            Path::new("/a b/π'"),
+        let binary = Path::new("/a b/π'");
+        let picker = picker_layout_node(
+            binary,
             Path::new("/s p"),
             Path::new("/r p"),
             Path::new("/p p"),
         );
+        let converted = convert_layout(&tree, &PaneId::new("b"), &picker, &|_| {
+            idle_layout_node(binary, None)
+        });
         let LaunchLayoutNode::Split {
             direction,
             ratio,
@@ -538,6 +597,113 @@ mod tests {
         assert_eq!(payload.source.target_content_height, 22);
         assert_eq!(payload.picker.content_width, 79);
         assert_eq!(payload.picker.content_height, 24);
+        PickerLaunchFiles::from_paths(snapshot, ready, painted)
+            .cleanup()
+            .unwrap();
+    }
+
+    fn split_layout() -> LayoutSnapshot {
+        let mut layout = source_layout(false);
+        layout.panes[0].rect = Rect::new(0, 0, 40, 24);
+        layout.panes.push(LayoutPane {
+            focused: false,
+            pane_id: "w1:p9".into(),
+            rect: Rect::new(40, 0, 40, 24),
+        });
+        layout.splits.push(crate::herdr::layout::LayoutSplit {
+            direction: SplitDirection::Right,
+            ratio: 0.5,
+            rect: Rect::new(0, 0, 80, 24),
+        });
+        layout
+    }
+
+    fn launch_split(action: PickerAction) -> (FakeClient, PickerSnapshot, Vec<String>) {
+        let mut client = FakeClient {
+            layout: Some(split_layout()),
+            ..FakeClient::default()
+        };
+        launch_layout_tab_picker(
+            &mut client,
+            &PaneId::new("w1:p1"),
+            Path::new("/tmp/herdr-flash"),
+            action,
+            Vec::new(),
+            true,
+            StylePalette::default(),
+        )
+        .unwrap();
+        let (snapshot, ready, painted) = client.launch_paths.clone().unwrap();
+        let payload = crate::herdr::snapshot::read_snapshot_file(&snapshot).unwrap();
+        let Some(LaunchLayoutNode::Split { second, .. }) = &client.launch_root else {
+            panic!("a split source must replay as a split");
+        };
+        let LaunchLayoutNode::Pane { command } = second.as_ref() else {
+            panic!("the sibling leaf must be a pane");
+        };
+        let idle = command.clone();
+        PickerLaunchFiles::from_paths(snapshot, ready, painted)
+            .with_sibling_reports(payload.source.siblings.len())
+            .cleanup()
+            .unwrap();
+        (client, payload, idle)
+    }
+
+    #[test]
+    fn flash_captures_siblings_and_their_placeholders_report_ttys() {
+        let (client, payload, idle) = launch_split(PickerAction::Flash);
+
+        // Both panes are read at their own content height (24 rows minus the border).
+        assert_eq!(
+            client.calls.iter().filter(|c| *c == "pane_read:22").count(),
+            2
+        );
+        assert_eq!(payload.source.siblings.len(), 1);
+        assert_eq!(payload.source.siblings[0].pane_id, PaneId::new("w1:p9"));
+        assert_eq!(payload.source.siblings[0].content_width, 37);
+        assert_eq!(idle[1..3], ["idle".to_string(), "--report".to_string()]);
+        assert!(idle[3].ends_with(".sibling0.tty"));
+    }
+
+    #[test]
+    fn pattern_pickers_stay_single_pane() {
+        let (_, payload, idle) = launch_split(PickerAction::Copy);
+
+        assert!(payload.source.siblings.is_empty());
+        assert_eq!(idle[1..], ["idle".to_string()]);
+    }
+
+    #[test]
+    fn a_zoomed_flash_source_searches_only_the_visible_pane() {
+        let mut layout = split_layout();
+        layout.zoomed = true;
+        let mut client = FakeClient {
+            layout: Some(layout),
+            ..FakeClient::default()
+        };
+
+        launch_layout_tab_picker(
+            &mut client,
+            &PaneId::new("w1:p1"),
+            Path::new("/tmp/herdr-flash"),
+            PickerAction::Flash,
+            Vec::new(),
+            true,
+            StylePalette::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            client
+                .calls
+                .iter()
+                .filter(|c| c.starts_with("pane_read"))
+                .count(),
+            1
+        );
+        let (snapshot, ready, painted) = client.launch_paths.unwrap();
+        let payload = crate::herdr::snapshot::read_snapshot_file(&snapshot).unwrap();
+        assert!(payload.source.siblings.is_empty());
         PickerLaunchFiles::from_paths(snapshot, ready, painted)
             .cleanup()
             .unwrap();
