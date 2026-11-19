@@ -56,6 +56,7 @@ Flash searches every pane visible in the tab, not just the focused one.
 | cursor / select | `t{char}` `f{char}` | till / find a character, forward across lines |
 | cursor / select | `T{char}` `F{char}` | the same, searching backward from the cursor |
 | cursor / select | `v` / `V` | start (or drop) a charwise / linewise selection |
+| cursor / select | `c` | exit Flash and focus the pane containing the cursor |
 | select | `o` | swap the cursor and the anchor |
 | select | `y` or Enter | yank the selection (inert while no selection is active) |
 | cursor / select | Backspace | back to search, query intact |

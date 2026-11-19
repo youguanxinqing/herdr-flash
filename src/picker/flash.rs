@@ -292,6 +292,14 @@ where
             match step {
                 SelectStep::Continue => {}
                 SelectStep::Cancel => return Ok(PickerOutcome::Cancelled),
+                SelectStep::FocusPane => {
+                    let pane_id = if *pane == 0 {
+                        snapshot.source.target_pane_id.clone()
+                    } else {
+                        siblings[*pane - 1].pane.pane_id.clone()
+                    };
+                    return Ok(PickerOutcome::FocusPane { pane_id });
+                }
                 SelectStep::BackToSearch => {
                     selection = None;
                     pending_char = None;
@@ -393,6 +401,7 @@ fn live_grid(width: u16, height: u16) -> (usize, usize) {
 enum SelectStep {
     Continue,
     Cancel,
+    FocusPane,
     BackToSearch,
     Yank,
 }
@@ -506,6 +515,7 @@ fn select_step(
         PickerInputEvent::Backspace => return SelectStep::BackToSearch,
         PickerInputEvent::Other => return SelectStep::Continue,
         PickerInputEvent::Char('y') => return SelectStep::Yank,
+        PickerInputEvent::Char('c') => return SelectStep::FocusPane,
         PickerInputEvent::Char('v') => {
             selection.begin(false);
             return SelectStep::Continue;
@@ -670,11 +680,9 @@ fn legend_line(
         }
         None if selection.active() => {
             let mode = if selection.linewise { "line" } else { "char" };
-            format!("  select {mode} · hjkl/wbe/0$ · o · t/f/T/F · y yank · bksp search · esc exit")
+            format!("  select {mode} · c focus · hjkl/wbe · o · t/f/T/F · y yank · bksp search · esc exit")
         }
-        None => {
-            "  cursor · hjkl/wbe/0$ · v/V select · t/f/T/F · bksp search · esc exit".to_string()
-        }
+        None => "  cursor · c focus · v/V select · bksp search · esc exit".to_string(),
     };
     status_row(query, &keys, width)
 }
@@ -885,6 +893,42 @@ mod tests {
         .unwrap();
         let painted = String::from_utf8(siblings.remove(0).out).unwrap();
         (outcome, painted)
+    }
+
+    #[test]
+    fn c_focuses_the_source_pane_containing_the_cursor() {
+        let (target, copied) = run(
+            vec![
+                PickerInputEvent::Char('x'),
+                PickerInputEvent::Enter,
+                PickerInputEvent::Char('c'),
+            ],
+            vec!["x"],
+        );
+        assert_eq!(
+            target,
+            PickerOutcome::FocusPane {
+                pane_id: PaneId::new("p1")
+            }
+        );
+        assert!(copied.is_empty());
+
+        let (other, _) = run_with_sibling(
+            vec![
+                PickerInputEvent::Char('x'),
+                PickerInputEvent::Char('s'),
+                PickerInputEvent::Char('v'),
+                PickerInputEvent::Char('c'),
+            ],
+            vec!["x"],
+            vec!["x"],
+        );
+        assert_eq!(
+            other,
+            PickerOutcome::FocusPane {
+                pane_id: PaneId::new("p2")
+            }
+        );
     }
 
     #[test]
