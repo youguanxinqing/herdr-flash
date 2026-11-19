@@ -377,6 +377,7 @@ pub struct RenderLine {
 pub enum PickerOutcome {
     Copied { text: String },
     OpenedUrl { url: String },
+    FocusPane { pane_id: PaneId },
     Cancelled,
     NoMatches,
 }

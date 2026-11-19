@@ -137,7 +137,11 @@ impl HerdrAdapter {
         // after close_tab, they leaked into the temp dir on every run.
         drop(reentry_guard);
         let files_cleanup = files.cleanup();
-        let cleanup = cleanup_session(&mut client, &snapshot.session, &temp_tab);
+        let focus_pane = match &primary {
+            Ok(crate::model::PickerOutcome::FocusPane { pane_id }) => Some(pane_id),
+            _ => None,
+        };
+        let cleanup = cleanup_session(&mut client, &snapshot.session, &temp_tab, focus_pane);
         match primary {
             Err(e) => {
                 if let Err(c) = cleanup {
@@ -148,7 +152,7 @@ impl HerdrAdapter {
                 }
                 Err(e)
             }
-            Ok(()) => {
+            Ok(_) => {
                 cleanup?;
                 files_cleanup?;
                 Ok(())

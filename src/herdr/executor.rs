@@ -5,8 +5,8 @@ use crate::herdr::layout::{
 };
 use crate::herdr::snapshot::{build_source_snapshot, wait_for_painted, PickerLaunchFiles};
 use crate::model::{
-    LayoutNode, PaneId, PatternSpec, PickerAction, PickerReturnContext, PickerSnapshot,
-    SiblingPane, StylePalette,
+    LayoutNode, PaneId, PatternSpec, PickerAction, PickerOutcome, PickerReturnContext,
+    PickerSnapshot, SiblingPane, StylePalette,
 };
 use crate::picker::Sibling;
 use crate::viewport::map_visible_viewport;
@@ -147,7 +147,7 @@ pub fn launch_layout_tab_picker<C: HerdrClient>(
     let focus_result = client.focus_pane(&applied.picker_pane_id);
 
     if let Err(error) = focus_result.and_then(|_| files.signal_ready()) {
-        if let Err(cleanup) = cleanup_session(client, &return_context, &applied.tab_id) {
+        if let Err(cleanup) = cleanup_session(client, &return_context, &applied.tab_id, None) {
             eprintln!("launch cleanup also failed: {cleanup:#}");
         }
 
@@ -265,6 +265,7 @@ pub fn cleanup_session<C: HerdrClient>(
     client: &mut C,
     session: &PickerReturnContext,
     temporary_tab_id: &str,
+    focus_pane: Option<&PaneId>,
 ) -> Result<()> {
     if temporary_tab_id.is_empty() {
         bail!("temporary picker tab id is missing");
@@ -283,6 +284,14 @@ pub fn cleanup_session<C: HerdrClient>(
         first = Some(e);
     }
 
+    if let Some(pane) = focus_pane {
+        if let Err(e) = client.focus_pane(pane) {
+            if first.is_none() {
+                first = Some(e);
+            }
+        }
+    }
+
     if let Err(e) = client.close_tab(temporary_tab_id) {
         if first.is_none() {
             first = Some(e);
@@ -295,12 +304,10 @@ pub fn cleanup_session<C: HerdrClient>(
 pub fn run_snapshot_picker(
     snapshot: &PickerSnapshot,
     siblings: &mut [Sibling<File>],
-) -> Result<()> {
+) -> Result<PickerOutcome> {
     match snapshot.action {
-        PickerAction::Flash => crate::picker::run_flash_picker(snapshot, siblings).map(|_| ()),
-        PickerAction::Copy | PickerAction::OpenUrl => {
-            crate::picker::run_picker(snapshot).map(|_| ())
-        }
+        PickerAction::Flash => crate::picker::run_flash_picker(snapshot, siblings),
+        PickerAction::Copy | PickerAction::OpenUrl => crate::picker::run_picker(snapshot),
     }
 }
 
@@ -358,9 +365,10 @@ mod tests {
 
         fn focus_pane(&mut self, pane: &PaneId) -> Result<()> {
             self.calls.push(format!("focus_pane:{pane}"));
-            let (_, ready, painted) = self.launch_paths.as_ref().context("missing launch paths")?;
-            assert!(!ready.exists(), "barrier released before picker focus");
-            assert!(painted.exists(), "picker focused before its first frame");
+            if let Some((_, ready, painted)) = &self.launch_paths {
+                assert!(!ready.exists(), "barrier released before picker focus");
+                assert!(painted.exists(), "picker focused before its first frame");
+            }
             if self.fail_focus_pane {
                 Err(anyhow!("focus failed"))
             } else {
@@ -737,6 +745,17 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_focuses_selected_source_before_closing_picker() {
+        let session = picker_snapshot().session;
+        let mut client = FakeClient::default();
+        cleanup_session(&mut client, &session, "w1:t2", Some(&PaneId::new("w1:p9"))).unwrap();
+        assert_eq!(
+            client.calls,
+            ["focus_tab:w1:t1", "focus_pane:w1:p9", "close_tab:w1:t2"]
+        );
+    }
+
+    #[test]
     fn cleanup_attempts_close_after_focus_failure_and_rejects_source_tab() {
         let session = picker_snapshot().session;
         let mut client = FakeClient {
@@ -744,11 +763,11 @@ mod tests {
             ..FakeClient::default()
         };
 
-        let error = cleanup_session(&mut client, &session, "w1:t2").unwrap_err();
+        let error = cleanup_session(&mut client, &session, "w1:t2", None).unwrap_err();
 
         assert_eq!(error.to_string(), "tab focus failed");
         assert_eq!(client.calls, ["focus_tab:w1:t1", "close_tab:w1:t2"]);
-        assert!(cleanup_session(&mut client, &session, "w1:t1")
+        assert!(cleanup_session(&mut client, &session, "w1:t1", None)
             .unwrap_err()
             .to_string()
             .contains("refusing"));
